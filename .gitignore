@@ -1,0 +1,9 @@
+.venv/
+.uv-cache/
+.triton-cache/
+.torchinductor-cache/
+__pycache__/
+*.pyc
+*.pyd
+.pytest_cache/
+data/*.pth

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=70", "wheel", "cmake>=3.18", "ninja", "pybind11>=2.11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggle-ptcg-engine"
+version = "0.1.0"
+description = "Native Pokemon TCG engine compatible with the Kaggle cg API."
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+build = [
+    "build>=1.2",
+    "cibuildwheel>=2.18",
+    "cmake>=3.18",
+    "ninja",
+    "pybind11>=2.11",
+]
+test = [
+    "pytest>=8",
+]
+
+[tool.setuptools]
+packages = ["cg", "data", "validation", "validation.oracle"]
+
+[tool.setuptools.package-data]
+data = ["*.csv", "*.json"]
+
+[tool.cibuildwheel]
+build = "cp311-manylinux_x86_64 cp312-manylinux_x86_64"
+skip = "*musllinux*"
+test-command = "python -m validation.smoke"
+
+[tool.cibuildwheel.linux]
+before-build = "pip install cmake ninja pybind11"

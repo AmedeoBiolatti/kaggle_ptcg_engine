@@ -1,0 +1,27 @@
+Competition Use Notice
+
+This repository is provided solely for use in connection with the relevant
+Kaggle Pokemon Trading Card Game competition, including local development,
+testing, validation, benchmarking, and competition submission work.
+
+No permission is granted to use, copy, modify, publish, distribute, sublicense,
+or exploit this repository or any derivative work outside that Kaggle
+competition context, except with explicit permission from the relevant rights
+holders.
+
+This repository is an unofficial implementation intended for compatibility and
+validation. It is not affiliated with, endorsed by, sponsored by, or approved by
+Kaggle, the competition organizers, The Pokemon Company, Nintendo, Creatures
+Inc., GAME FREAK inc., or any other Pokemon rights holder.
+
+Pokemon, Pokemon Trading Card Game, card names, card text, game rules, artwork,
+trademarks, and related intellectual property remain the property of their
+respective owners, including the competition organizers and Pokemon rights
+holders where applicable. All such rights are reserved by those owners.
+
+The reference Kaggle cg API, competition materials, and any official
+competition rules or datasets remain subject to the terms set by Kaggle and the
+competition organizers. If this notice conflicts with the Kaggle competition
+rules or official terms, those official terms control.
+
+This repository is provided "as is", without warranty of any kind.

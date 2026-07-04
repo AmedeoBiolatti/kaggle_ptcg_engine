@@ -1,0 +1,6 @@
+include LICENSE
+include README.md
+include README_KAGGLE.md
+recursive-include data *.csv *.json
+recursive-include engine CMakeLists.txt *.cpp *.hpp *.h
+recursive-include notebooks *.ipynb
