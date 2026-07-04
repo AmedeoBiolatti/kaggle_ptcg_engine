@@ -42,6 +42,7 @@ def _engine():
         return _ENGINE_CACHE
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     build_dirs = [
+        os.path.join(root, "engine"),
         os.path.join(root, "engine", "build", "Release"),
         os.path.join(root, "engine", "build"),
     ]

@@ -18,6 +18,11 @@ class CMakeExtension(Extension):
 
 
 class CMakeBuild(build_ext):
+    def run(self) -> None:
+        if "editable_wheel" in sys.argv:
+            return
+        super().run()
+
     def build_extension(self, ext: CMakeExtension) -> None:
         extdir = Path(self.get_ext_fullpath(ext.name)).resolve().parent
         build_temp = Path(self.build_temp) / ext.name
@@ -60,7 +65,11 @@ class CMakeBuild(build_ext):
         raise RuntimeError(f"CMake build did not produce {expected}")
 
 
+def _editable_install() -> bool:
+    return any(arg in {"editable_wheel", "develop"} for arg in sys.argv)
+
+
 setup(
-    ext_modules=[CMakeExtension("ptcg_engine")],
+    ext_modules=[] if _editable_install() else [CMakeExtension("ptcg_engine")],
     cmdclass={"build_ext": CMakeBuild},
 )

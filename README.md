@@ -54,21 +54,38 @@ Dataset:
 
 See `README_KAGGLE.md` for the full notebook install flow.
 
-Install Python build dependencies:
+For local development, install the Python package in editable mode. If you are
+offline or pip build isolation cannot reach PyPI, use `--no-build-isolation`
+after installing the requirements in your current environment.
 
 ```bash
-python -m pip install -e ".[build,test]"
+python -m pip install -e ".[test]"
+# offline/local env variant:
+python -m pip install -e ".[test]" --no-build-isolation
 ```
 
-Build the native extension:
+Then build the native extension.
 
 ```bash
-cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
-cmake --build engine/build --config Release
+python -m pip install cmake ninja pybind11
 ```
 
-The Python modules search `engine/build/Release` and `engine/build` for the
-compiled extension.
+On Windows with Visual Studio Build Tools installed:
+
+```powershell
+.\engine\build.ps1
+```
+
+On Linux:
+
+```bash
+cmake -S engine -B engine/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
+cmake --build engine/build --parallel
+```
+
+The Python modules search `engine/`, `engine/build/Release`, and `engine/build`
+for the compiled extension.
 
 To build a wheel locally:
 
