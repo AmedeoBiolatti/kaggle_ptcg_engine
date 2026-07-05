@@ -2,7 +2,7 @@
 
 Mode 1: offline random games on a deck.
 Mode 2: use ``PTCG_BACKEND=shadow`` in normal code to compare every public
-``cg.game`` call while returning the configured primary engine's observation.
+``ptcg.cg.game`` call while returning the configured primary engine's observation.
 """
 from __future__ import annotations
 

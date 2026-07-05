@@ -1,7 +1,7 @@
 # Kaggle PTCG Native Engine
 
 Native Pokemon TCG engine with a Python compatibility layer for the Kaggle
-`cg.game` and `cg.api` interfaces.
+`ptcg.cg.game` and `ptcg.cg.api` interfaces.
 
 The goal is to make the native engine usable as a drop-in backend for local
 experiments, validation, and performance benchmarking while keeping the public
@@ -22,7 +22,8 @@ See `LICENSE` for the full competition-use notice.
 ## Repository Layout
 
 - `engine/`: C++ engine core and `pybind11` extension.
-- `cg/`: Python compatibility modules for `cg.game` and `cg.api`.
+- `ptcg/cg/`: Python compatibility modules for `ptcg.cg.game`
+  and `ptcg.cg.api`.
 - `validation/`: deck fixtures, random deck generation, parity checks, and
   shadow-mode helpers.
 - `benchmarks/`: speed comparison scripts for `cg` format, direct native calls,
@@ -96,16 +97,16 @@ python -m build --wheel
 
 Upload the produced `dist/*.whl` to a Kaggle Dataset for notebook use.
 
-## Use As `cg.game`
+## Use As `ptcg.cg.game`
 
-Set `PTCG_BACKEND=native` before importing or calling `cg.game`:
+Set `PTCG_BACKEND=native` before importing or calling `ptcg.cg.game`:
 
 ```python
 import os
 
 os.environ["PTCG_BACKEND"] = "native"
 
-from cg.game import battle_start, battle_select, battle_finish
+from ptcg.cg.game import battle_start, battle_select, battle_finish
 from validation.decks import MEGA_LUCARIO
 
 obs, start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
@@ -143,8 +144,9 @@ through the reference engine, bootstraps native from the first post-setup public
 state, then advances both engines in lockstep and raises if public observations
 diverge.
 
-The reference `cg.dll` or `libcg.so` is optional and is not included. Place it in
-`cg/` only when you want to run reference parity or shadow validation.
+The reference `cg.dll` or `libcg.so` is optional and is not included. Set
+`PTCG_REFERENCE_LIB` to its full path, or place it in a local `cg/` folder, only
+when you want to run reference parity or shadow validation.
 
 ## Benchmark
 
@@ -156,7 +158,7 @@ The benchmark reports:
 
 - `reference_cg_format`: reference `cg.game`, when a reference shared library is
   available.
-- `native_cg_format`: `cg.game` with `PTCG_BACKEND=native`.
+- `native_cg_format`: `ptcg.cg.game` with `PTCG_BACKEND=native`.
 - `native_direct`: direct `ptcg_engine` state/action stepping.
 - `native_vectorized`: batched stepping through `ptcg_engine.VectorEnv`.
 
@@ -165,7 +167,7 @@ native rows still run.
 
 ## Useful Environment Variables
 
-- `PTCG_BACKEND=native`: route `cg.game` calls to the native engine.
+- `PTCG_BACKEND=native`: route `ptcg.cg.game` calls to the native engine.
 - `PTCG_BACKEND=shadow`: run reference and native in lockstep.
 - `PTCG_NATIVE_SEED=<int>`: seed native free-running games.
 - `PTCG_NATIVE_LAZY_SEARCH=1`: use faster in-process `search_begin_input`

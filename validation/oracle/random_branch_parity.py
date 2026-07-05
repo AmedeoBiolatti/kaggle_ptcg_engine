@@ -41,8 +41,8 @@ for _p in (ROOT, BUILD_DIR):
         sys.path.insert(0, _p)
 
 import ptcg_engine as eng  # noqa: E402
-from cg.api import all_card_data, search_begin, search_end, search_release, search_step, to_observation_class  # noqa: E402
-from cg.game import battle_finish, battle_select, battle_start  # noqa: E402
+from ptcg.cg.api import all_card_data, search_begin, search_end, search_release, search_step, to_observation_class  # noqa: E402
+from ptcg.cg.game import battle_finish, battle_select, battle_start  # noqa: E402
 from validation.decks import ALL_DECKS, generate_random_decks  # noqa: E402
 from validation.oracle.canonical import canonical_options, canonical_state, diff  # noqa: E402
 

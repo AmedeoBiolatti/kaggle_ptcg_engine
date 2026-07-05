@@ -5,7 +5,7 @@ into the flat list the engine expects.
 """
 from __future__ import annotations
 
-from cg.api import CardType, _native_all_card_data
+from ptcg.cg.api import CardType, _native_all_card_data
 
 
 def expand(pairs: list[tuple[int, int]]) -> list[int]:

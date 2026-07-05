@@ -49,7 +49,7 @@ def main() -> int:
     os.environ.setdefault("PTCG_BACKEND", "native")
 
     engine = _import_engine()
-    from cg.game import battle_finish, battle_select, battle_start
+    from ptcg.cg.game import battle_finish, battle_select, battle_start
     from validation.decks import MEGA_LUCARIO
 
     print("ptcg_engine:", engine.version(), getattr(engine, "__file__", "<built-in>"))

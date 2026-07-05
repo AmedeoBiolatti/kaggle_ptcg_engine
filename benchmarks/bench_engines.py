@@ -3,7 +3,7 @@
 The four measured paths are intentionally separate:
 
 * reference_cg_format: original ``cg.game`` if the closed shared library exists.
-* native_cg_format: ``cg.game`` with ``PTCG_BACKEND=native``.
+* native_cg_format: ``ptcg.cg.game`` with ``PTCG_BACKEND=native``.
 * native_direct: direct ``ptcg_engine`` GameState + native action indices.
 * native_vectorized: ``ptcg_engine.VectorEnv`` stepping N games per call.
 
@@ -11,7 +11,8 @@ Run from the repository root:
 
     python benchmarks/bench_engines.py --steps 2000 --batch-size 256
 
-When a reference ``cg`` shared library is not present in ``cg/``,
+When a reference ``cg`` package is not available through ``PTCG_REFERENCE_ROOT``
+or a local ``cg/`` folder,
 ``reference_cg_format`` is reported as skipped.
 """
 from __future__ import annotations
@@ -106,12 +107,17 @@ def _cg_shared_lib_exists(package_root: Path) -> bool:
 
 
 def _reference_root() -> Path | None:
+    explicit = os.environ.get("PTCG_REFERENCE_ROOT")
+    if explicit:
+        root = Path(explicit)
+        if _cg_shared_lib_exists(root):
+            return root
     return ROOT if _cg_shared_lib_exists(ROOT) else None
 
 
 def _clear_cg_modules() -> None:
     for name in list(sys.modules):
-        if name == "cg" or name.startswith("cg."):
+        if name == "cg" or name.startswith("cg.") or name == "ptcg.cg" or name.startswith("ptcg.cg."):
             del sys.modules[name]
 
 
@@ -147,7 +153,7 @@ def bench_cg_game(deck0: list[int], deck1: list[int], *, steps: int, seed: int,
         ref_root = _reference_root()
         if ref_root is None:
             raise RuntimeError(
-                "reference cg shared library not found in cg/"
+                "reference cg package not found; set PTCG_REFERENCE_ROOT or provide ./cg/"
             )
         _clear_cg_modules()
         _prefer_import_root(ref_root)
@@ -162,7 +168,10 @@ def bench_cg_game(deck0: list[int], deck1: list[int], *, steps: int, seed: int,
         os.environ["PTCG_NATIVE_SEED"] = str(seed)
         os.environ["PTCG_NATIVE_LAZY_SEARCH"] = "1"
 
-    import cg.game as game
+    if backend == "reference":
+        import cg.game as game
+    else:
+        import ptcg.cg.game as game
 
     rng = random.Random(seed)
     done_steps = 0

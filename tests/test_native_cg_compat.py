@@ -16,10 +16,22 @@ for path in (ENGINE_DIR, BUILD_DIR_NINJA, BUILD_DIR, ROOT):
 from validation.decks import MEGA_LUCARIO  # noqa: E402
 
 
-def _reference_cg_dll_exists() -> bool:
+def _reference_cg_dll_path() -> str | None:
+    explicit = os.environ.get("PTCG_REFERENCE_LIB")
+    if explicit and os.path.exists(explicit):
+        return explicit
     names = ("cg.dll", "libcg.so")
     candidates = [os.path.join(ROOT, "cg")]
-    return any(os.path.exists(os.path.join(path, name)) for path in candidates for name in names)
+    for path in candidates:
+        for name in names:
+            candidate = os.path.join(path, name)
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def _reference_cg_dll_exists() -> bool:
+    return _reference_cg_dll_path() is not None
 
 
 class NativeCgCompatTest(unittest.TestCase):
@@ -52,8 +64,8 @@ class NativeCgCompatTest(unittest.TestCase):
             os.environ["PTCG_NATIVE_CPP_BATTLE"] = self.old_cpp_battle
 
     def test_battle_select_exposes_pending_prompt(self) -> None:
-        from cg.game import battle_finish, battle_select, battle_start
-        from cg.native_payload import decode_native_search_begin
+        from ptcg.cg.game import battle_finish, battle_select, battle_start
+        from ptcg.cg.native_payload import decode_native_search_begin
 
         obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
         self.assertEqual(obs["select"]["context"], 0)
@@ -78,8 +90,8 @@ class NativeCgCompatTest(unittest.TestCase):
         battle_finish()
 
     def test_search_begin_restores_pending_prompt_from_native_payload(self) -> None:
-        from cg.api import search_begin, search_step, to_observation_class
-        from cg.game import battle_select, battle_start
+        from ptcg.cg.api import search_begin, search_step, to_observation_class
+        from ptcg.cg.game import battle_select, battle_start
 
         obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
         pending = battle_select([2])
@@ -94,9 +106,9 @@ class NativeCgCompatTest(unittest.TestCase):
         self.assertEqual(child.observation.select.context, 0)
 
     def test_lazy_search_begin_restores_latest_pending_prompt(self) -> None:
-        from cg.api import search_begin, search_step, to_observation_class
-        from cg.game import battle_select, battle_start
-        from cg.native_payload import decode_native_search_begin
+        from ptcg.cg.api import search_begin, search_step, to_observation_class
+        from ptcg.cg.game import battle_select, battle_start
+        from ptcg.cg.native_payload import decode_native_search_begin
 
         os.environ.pop("PTCG_NATIVE_PORTABLE_SEARCH", None)
         os.environ["PTCG_NATIVE_LAZY_SEARCH"] = "1"
@@ -117,8 +129,8 @@ class NativeCgCompatTest(unittest.TestCase):
         self.assertEqual(child.observation.select.context, 0)
 
     def test_lazy_search_begin_rejects_stale_pending_prompt(self) -> None:
-        from cg.api import search_begin, to_observation_class
-        from cg.game import battle_select, battle_start
+        from ptcg.cg.api import search_begin, to_observation_class
+        from ptcg.cg.game import battle_select, battle_start
 
         os.environ.pop("PTCG_NATIVE_PORTABLE_SEARCH", None)
         os.environ["PTCG_NATIVE_LAZY_SEARCH"] = "1"
@@ -134,7 +146,7 @@ class NativeCgCompatTest(unittest.TestCase):
             )
 
     def test_cpp_battle_object_backend_smoke(self) -> None:
-        from cg.game import battle_finish, battle_select, battle_start
+        from ptcg.cg.game import battle_finish, battle_select, battle_start
 
         os.environ["PTCG_NATIVE_CPP_BATTLE"] = "1"
 
@@ -147,9 +159,9 @@ class NativeCgCompatTest(unittest.TestCase):
         battle_finish()
 
     def test_search_begin_rejects_stale_pending_native_payload(self) -> None:
-        from cg.api import search_begin, to_observation_class
-        from cg.game import battle_select, battle_start
-        from cg.native_payload import decode_native_search_begin, encode_native_search_begin
+        from ptcg.cg.api import search_begin, to_observation_class
+        from ptcg.cg.game import battle_select, battle_start
+        from ptcg.cg.native_payload import decode_native_search_begin, encode_native_search_begin
 
         _obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
         pending = battle_select([2])
@@ -168,9 +180,9 @@ class NativeCgCompatTest(unittest.TestCase):
             )
 
     def test_search_begin_restores_pending_prompt_from_portable_snapshot(self) -> None:
-        from cg.api import search_begin, search_step, to_observation_class
-        from cg.game import battle_select, battle_start
-        from cg.native_payload import decode_native_search_begin, encode_native_search_begin
+        from ptcg.cg.api import search_begin, search_step, to_observation_class
+        from ptcg.cg.game import battle_select, battle_start
+        from ptcg.cg.native_payload import decode_native_search_begin, encode_native_search_begin
 
         _obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
         pending = battle_select([2])
@@ -192,8 +204,8 @@ class NativeCgCompatTest(unittest.TestCase):
         self.assertEqual(child.observation.select.context, 0)
 
     def test_search_step_exposes_pending_prompt_with_known_deck(self) -> None:
-        from cg.api import search_begin, search_step, to_observation_class
-        from cg.game import battle_start
+        from ptcg.cg.api import search_begin, search_step, to_observation_class
+        from ptcg.cg.game import battle_start
 
         root = self._native_search_root(battle_start, search_begin, to_observation_class)
 
@@ -206,8 +218,8 @@ class NativeCgCompatTest(unittest.TestCase):
         self.assertEqual(child.observation.logs[0].type, 10)
 
     def test_search_begin_preserves_true_hidden_zones_at_main_root(self) -> None:
-        from cg.api import search_begin, to_observation_class
-        from cg.game import battle_start
+        from ptcg.cg.api import search_begin, to_observation_class
+        from ptcg.cg.game import battle_start
 
         obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
         root = self._native_search_from_live_hidden(
@@ -218,8 +230,8 @@ class NativeCgCompatTest(unittest.TestCase):
         self._assert_search_hidden_matches_live(root.searchId)
 
     def test_search_begin_preserves_true_hidden_zones_at_pending_deck_prompt(self) -> None:
-        from cg.api import search_begin, to_observation_class
-        from cg.game import battle_select, battle_start
+        from ptcg.cg.api import search_begin, to_observation_class
+        from ptcg.cg.game import battle_select, battle_start
 
         _obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
         pending = battle_select([2])
@@ -232,8 +244,8 @@ class NativeCgCompatTest(unittest.TestCase):
         self._assert_search_hidden_matches_live(root.searchId)
 
     def test_search_release_and_select_validation_match_public_errors(self) -> None:
-        from cg.api import search_begin, search_release, search_step, to_observation_class
-        from cg.game import battle_start
+        from ptcg.cg.api import search_begin, search_release, search_step, to_observation_class
+        from ptcg.cg.game import battle_start
 
         root = self._native_search_root(battle_start, search_begin, to_observation_class)
 
@@ -253,9 +265,9 @@ class NativeCgCompatTest(unittest.TestCase):
             search_step(root.searchId, [0])
 
     def test_native_card_and_attack_metadata_match_public_api(self) -> None:
-        import cg.api as api
+        import ptcg.cg.api as api
 
-        if not os.path.exists(os.path.join(ROOT, "cg", "cg.dll")):
+        if not _reference_cg_dll_exists():
             raise unittest.SkipTest("reference cg.dll is not present in this checkout")
 
         os.environ.pop("PTCG_BACKEND", None)
@@ -284,16 +296,20 @@ class NativeCgCompatTest(unittest.TestCase):
             self.assertEqual(native.text, official.text)
 
     def test_shadow_backend_bootstraps_through_setup(self) -> None:
-        from cg.game import battle_finish, battle_start
-        from cg.game import battle_select
+        from ptcg.cg.game import battle_finish, battle_start
+        from ptcg.cg.game import battle_select
 
         if not _reference_cg_dll_exists():
             raise unittest.SkipTest("reference cg shared library is not present in this checkout")
 
         old_backend = os.environ.get("PTCG_BACKEND")
         old_primary = os.environ.get("PTCG_SHADOW_PRIMARY")
+        old_reference = os.environ.get("PTCG_REFERENCE_LIB")
+        reference_lib = _reference_cg_dll_path()
         os.environ["PTCG_BACKEND"] = "shadow"
         os.environ["PTCG_SHADOW_PRIMARY"] = "cg"
+        if reference_lib is not None:
+            os.environ["PTCG_REFERENCE_LIB"] = reference_lib
         try:
             obs, start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
             self.assertEqual(start.errorType, 0)
@@ -318,6 +334,10 @@ class NativeCgCompatTest(unittest.TestCase):
                 os.environ.pop("PTCG_SHADOW_PRIMARY", None)
             else:
                 os.environ["PTCG_SHADOW_PRIMARY"] = old_primary
+            if old_reference is None:
+                os.environ.pop("PTCG_REFERENCE_LIB", None)
+            else:
+                os.environ["PTCG_REFERENCE_LIB"] = old_reference
 
     def _native_search_root(self, battle_start, search_begin, to_observation_class):
         obs, _start = battle_start(MEGA_LUCARIO, MEGA_LUCARIO)
@@ -338,7 +358,7 @@ class NativeCgCompatTest(unittest.TestCase):
 
     def _native_search_from_live_hidden(self, ob, search_begin, *, validate: bool = False):
         import ptcg_engine as E
-        from cg.native_backend import NativeBattle
+        from ptcg.cg.native_backend import NativeBattle
 
         old_validate = os.environ.get("PTCG_NATIVE_VALIDATE_SEARCH")
         if validate:
@@ -365,8 +385,8 @@ class NativeCgCompatTest(unittest.TestCase):
 
     def _assert_search_hidden_matches_live(self, search_id: int) -> None:
         import ptcg_engine as E
-        import cg.api as api
-        from cg.native_backend import NativeBattle
+        import ptcg.cg.api as api
+        from ptcg.cg.native_backend import NativeBattle
 
         live = E.native_state_summary(NativeBattle.state)["hidden"]["players"]
         search = api._native_search_state_summary(search_id)["hidden"]["players"]

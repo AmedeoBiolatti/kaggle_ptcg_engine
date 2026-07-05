@@ -14,7 +14,7 @@ import os
 import random
 from typing import Iterable, Literal, Sequence
 
-from cg.api import (
+from ptcg.cg.api import (
     CardType,
     EnergyType,
     _native_all_attack,
@@ -70,7 +70,7 @@ OWNER_TAGS = {
     "Ethan": "owner:ethan",
     "Steven": "owner:steven",
     "N's": "owner:n",
-    "N’s": "owner:n",
+    "N's": "owner:n",
     "Hop": "owner:hop",
 }
 
@@ -415,7 +415,7 @@ class RandomDeckGenerator:
                         continue
                     pieces = [
                         row.get("Card Name", ""),
-                        row.get("Stage (Pokémon)/Type (Energy and Trainer)", ""),
+                        row.get("Stage (Pokemon)/Type (Energy and Trainer)", ""),
                         row.get("Rule", ""),
                         row.get("Category", ""),
                         row.get("Previous stage", ""),
@@ -527,8 +527,8 @@ class RandomDeckGenerator:
         roles: set[str] = set()
 
         has_search = "search your deck" in folded
-        mentions_pokemon = "pokemon" in folded or "pokÃ©mon" in folded
-        mentions_basic_pokemon = "basic pokemon" in folded or "basic pokÃ©mon" in folded
+        mentions_pokemon = "pokemon" in folded or "pokémon" in folded
+        mentions_basic_pokemon = "basic pokemon" in folded or "basic pokémon" in folded
         mentions_energy = "energy" in folded
 
         if has_search and mentions_pokemon:
