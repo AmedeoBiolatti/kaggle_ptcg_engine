@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "kaggle-ptcg-engine"
 version = "0.1.0"
 description = "Native Pokemon TCG engine compatible with the Kaggle cg API."
-license = { text = "LicenseRef-Kaggle-Competition-Use-Only" }
+license = "LicenseRef-Kaggle-Competition-Use-Only"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy>=1.26",
