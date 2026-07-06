@@ -4246,8 +4246,11 @@ static int discard_special_energy_from(GameState& st, int ownerSide, InPlay& p) 
     erase_attached_energy_card(p, k);
     ++discarded;
   }
-  if (discarded > 0)
+  if (discarded > 0) {
     refresh_energy_units_from_attached_cards(st, ownerSide, p);
+    refresh_inplay_max_hp(st, p, ownerSide);  // a discarded Special Energy may
+                                              // have granted +maxHp (e.g. +20 {G})
+  }
   return discarded;
 }
 
@@ -10293,10 +10296,12 @@ static int attached_energy_hp_bonus(int cardId,
       if (e == FIGHTING) ++n;
     return 40 * n;  // Conkeldurr: +40 HP for each {F} Energy attached.
   }
-  if (pokemon_has_type(cardId, GRASS) &&
-      std::find(energyCardIds.begin(), energyCardIds.end(), 18) !=
-          energyCardIds.end())
-    return 20;  // Grow Grass Energy: attached {G} Pokemon.
+  if (pokemon_has_type(cardId, GRASS)) {
+    int growGrass = 0;
+    for (int id : energyCardIds)
+      if (id == 18) ++growGrass;  // Grow Grass Energy: +20 per copy on a {G} Pokemon
+    if (growGrass > 0) return 20 * growGrass;
+  }
   return 0;
 }
 
