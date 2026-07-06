@@ -127,12 +127,11 @@ def _cg_finish() -> None:
 
 def _native_debug():
     try:
-        import ptcg_engine as E
-        from .native_backend import NativeBattle
+        from . import native_backend
 
-        if NativeBattle.state is None:
+        if native_backend.NativeBattle.state is None:
             return None
-        return E.native_state_summary(NativeBattle.state)
+        return native_backend._engine().native_state_summary(native_backend.NativeBattle.state)
     except Exception:
         return None
 
@@ -163,9 +162,9 @@ def _bootstrap_native_from_cg(cg_obs: dict[str, Any] | None) -> dict[str, Any] |
     if cg_obs is None or _setup_in_progress(cg_obs):
         return None
 
-    import ptcg_engine as E
     from . import native_backend
 
+    E = native_backend._engine()
     state = E.load_state(cg_obs["current"], ShadowBattle.seed, None)
     obs, context, descriptors = E.cg_observation_with_view(state)
     obs["logs"] = list(cg_obs.get("logs") or [])
@@ -208,6 +207,9 @@ def battle_start(deck0: list[int], deck1: list[int]):
     if len(deck0) != 60 or len(deck1) != 60:
         raise ValueError("The deck must contain 60 cards.")
 
+    from . import native_backend
+
+    native_backend.battle_finish()
     ShadowBattle.trace = []
     ShadowBattle.deck0 = list(deck0)
     ShadowBattle.deck1 = list(deck1)

@@ -330,6 +330,9 @@ struct GameState {
 SmallVec<int, 24> provided_energy_units(const InPlay& pk,
                                         const GameState* st = nullptr,
                                         int ownerSide = -1);
+int provided_energy_units_for_card(const InPlay& pk, int energyIdx,
+                                   const GameState* st,
+                                   int ownerSide);
 
 // Generate the structural (card-agnostic) MAIN-phase legal options for the
 // acting player (st.yourIndex). Card-specific legality is layered on later.

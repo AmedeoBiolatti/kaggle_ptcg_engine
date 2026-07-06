@@ -904,12 +904,17 @@ def _parse_native_card_db() -> tuple[list[CardData], list[Attack]]:
                     )
                 attack_ids.append(attack_id)
 
-            evolves_from = (
-                None
-                if match.group(16) == "nullptr"
-                else _decode_cpp_string(match.group(17))
-            )
             official_card = official_cards.get(card_id)
+            if official_card:
+                evolves_from = official_card.evolvesFrom
+            elif "evolvesFrom" in card_meta:
+                evolves_from = card_meta.get("evolvesFrom")
+            else:
+                evolves_from = (
+                    None
+                    if match.group(16) == "nullptr"
+                    else _decode_cpp_string(match.group(17))
+                )
             name = (
                 official_card.name
                 if official_card

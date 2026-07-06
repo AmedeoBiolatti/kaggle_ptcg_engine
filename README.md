@@ -159,11 +159,26 @@ The benchmark reports:
 - `reference_cg_format`: reference `cg.game`, when a reference shared library is
   available.
 - `native_cg_format`: `ptcg.cg.game` with `PTCG_BACKEND=native`.
-- `native_direct`: direct `ptcg_engine` state/action stepping.
-- `native_vectorized`: batched stepping through `ptcg_engine.VectorEnv`.
+- `native_rl_step_only`: direct `ptcg_engine` compact action stepping.
+- `native_rl_compact_obs`: direct stepping while building `rl_encode_obs`.
+- `native_rl_action_features`: direct stepping while building action features.
+- `native_rl_action_ids`: direct stepping while building packed symbolic action
+  tensors for embedding-based models and select reconstruction.
+- `native_rl_card_features`: direct stepping while building card-slot features.
+- `native_rl_state_observation`: direct stepping while building the lightweight
+  structured state observation.
+- `native_rl_state_ids`: direct stepping while building complete packed symbolic
+  tensors for embedding-based models, including the current public state and
+  legal select prompt.
+- `native_vectorized`: batched compact stepping through `ptcg_engine.VectorEnv`.
+- `native_vectorized_action_ids`: batched compact stepping while building packed
+  symbolic action tensors.
 
-If the reference shared library is absent, the reference row is skipped and the
-native rows still run.
+By default the benchmark only prints rows supported by the loaded extension.
+Use `--include-reference` to also test the original `cg.game` package,
+`--include-descriptor` to test the legacy descriptor stepping path when present,
+and `--include-unavailable` to show rows for APIs missing from the current
+build. Use `--strict-skips` when skipped rows should fail the command.
 
 ## Useful Environment Variables
 

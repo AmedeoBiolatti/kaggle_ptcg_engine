@@ -14,7 +14,7 @@ namespace ptcg {
 constexpr int RL_MAX_ACTIONS = 64;  // cap on options at any single decision
 constexpr int PPO_ACTION_FEAT_DIM = 128;
 constexpr int PPO_CARD_SLOTS = 64;
-constexpr int PPO_CARD_FEAT_DIM = 32;
+constexpr int PPO_CARD_FEAT_DIM = 80;
 constexpr int PPO_DECK_SLOTS = 60;
 constexpr int PPO_BELIEF_SLOTS = 40;
 constexpr int PPO_BELIEF_SUMMARY_DIM = 52;
@@ -162,6 +162,8 @@ class VectorEnv {
                int32_t* result) const;
   void step(const int* actions, float* obs, float* reward, uint8_t* done,
             uint8_t* mask, int32_t* player, int32_t* result);
+  const GameState& state_at(int i) const { return games_[i]; }
+  const RlOptionSet& options_at(int i) const { return opts_[i]; }
 
  private:
   void reset(int i);

@@ -374,13 +374,102 @@ struct CachedCardSummary {
   std::array<float, PPO_CARD_FEAT_DIM> features{};
 };
 
+namespace card_feat {
+constexpr int kEnergyTypes = TEAM_ROCKET + 1;
+
+enum Index {
+  PRESENT = 0,
+  CARD_ID = 1,
+  CARD_TYPE_BASE = 2,
+  HP = 9,
+  RETREAT = 10,
+  BASIC = 11,
+  STAGE1 = 12,
+  STAGE2 = 13,
+  EX = 14,
+  MEGA_EX = 15,
+  TERA = 16,
+  ACE_SPEC = 17,
+  HAS_ABILITY = 18,
+  FREE_RETREAT = 19,
+  ATTACK_COUNT = 20,
+  MAX_DAMAGE = 21,
+  MIN_COST = 22,
+  ENERGY_TYPE = 23,
+  WEAKNESS = 24,
+  RESISTANCE = 25,
+  OWNER_SELF = 26,
+  OWNER_OPP = 27,
+  AREA = 28,
+  INDEX = 29,
+  HP_RATIO = 30,
+  ATTACHED_ENERGY_COUNT = 31,
+  ATTACK_COST_TYPE_BASE = 32,
+  BEST_DAMAGE_BUDGET_BASE = 44,
+  MIN_COLORED_COST = 48,
+  MAX_COLORED_COST = 49,
+  MEAN_DAMAGE = 50,
+  DAMAGE_ATTACK_COUNT = 51,
+  ATTACHED_ENERGY_TYPE_BASE = 52,
+  READY_ATTACK_COUNT = 64,
+  BEST_READY_DAMAGE = 65,
+  MIN_MISSING_ATTACK_COST = 66,
+  BEST_DAMAGE_MISSING_COST = 67,
+  TOOL_COUNT = 68,
+  PRE_EVO_COUNT = 69,
+  DAMAGE_COUNTERS = 70,
+  NO_ATTACK = 71,
+  NO_RETREAT = 72,
+  PREVENT_DAMAGE = 73,
+  TAKE_MORE_DAMAGE = 74,
+  ATTACK_DAMAGE_DELTA = 75,
+  DAMAGE_REDUCTION = 76,
+  ABILITY_USED = 77,
+  MOVED_TO_ACTIVE = 78,
+  HEALED_THIS_TURN = 79,
+};
+
+static_assert(ATTACHED_ENERGY_TYPE_BASE + kEnergyTypes <= READY_ATTACK_COUNT);
+static_assert(HEALED_THIS_TURN < PPO_CARD_FEAT_DIM);
+}  // namespace card_feat
+
+static int energy_feature_index(int energy_type) {
+  return std::clamp(energy_type, 0, card_feat::kEnergyTypes - 1);
+}
+
+static float norm_card_id(int cid) {
+  return std::clamp(cid / 2000.0f, 0.0f, 1.0f);
+}
+
+static float norm_damage(int damage) {
+  return std::clamp(damage / 350.0f, 0.0f, 1.0f);
+}
+
+static float norm_energy_count(int count, int denom = 12) {
+  return std::clamp(static_cast<float>(count) / static_cast<float>(denom),
+                    0.0f, 1.0f);
+}
+
+static float norm_optional_energy_type(int energy_type) {
+  if (energy_type < 0 || energy_type > TEAM_ROCKET) return 0.0f;
+  return static_cast<float>(energy_type + 1) /
+         static_cast<float>(card_feat::kEnergyTypes);
+}
+
+static int colored_attack_cost(const AttackInfo& at) {
+  int colored = 0;
+  for (int i = 0; i < at.n_cost; ++i)
+    if (at.cost[i] != COLORLESS) ++colored;
+  return colored;
+}
+
 static CachedCardSummary build_cached_card_summary(int cid) {
   CachedCardSummary out;
   if (cid <= 0) return out;
 
-  out.summary[0] = std::clamp(cid / 2000.0f, 0.0f, 1.0f);
-  out.features[0] = 1.0f;  // known/present
-  out.features[1] = out.summary[0];
+  out.summary[0] = norm_card_id(cid);
+  out.features[card_feat::PRESENT] = 1.0f;  // known/present
+  out.features[card_feat::CARD_ID] = out.summary[0];
 
   const CardInfo* c = find_card(cid);
   if (!c) return out;
@@ -396,34 +485,65 @@ static CachedCardSummary build_cached_card_summary(int cid) {
   if (c->ex) out.summary[4] = 1.0f;
   if (c->megaEx) out.summary[5] = 1.0f;
 
-  out.features[2 + std::min(std::max(c->cardType, 0), 6)] = 1.0f;
-  out.features[9] = c->hp / 400.0f;
-  out.features[10] = std::clamp(c->retreat / 5.0f, 0.0f, 1.0f);
-  out.features[11] = c->basic ? 1.0f : 0.0f;
-  out.features[12] = c->stage1 ? 1.0f : 0.0f;
-  out.features[13] = c->stage2 ? 1.0f : 0.0f;
-  out.features[14] = c->ex ? 1.0f : 0.0f;
-  out.features[15] = c->megaEx ? 1.0f : 0.0f;
-  out.features[16] = c->tera ? 1.0f : 0.0f;
-  out.features[17] = c->aceSpec ? 1.0f : 0.0f;
-  out.features[18] = c->hasAbility ? 1.0f : 0.0f;
-  out.features[19] = c->freeRetreat ? 1.0f : 0.0f;
-  out.features[20] = std::clamp(c->n_attacks / 4.0f, 0.0f, 1.0f);
+  out.features[card_feat::CARD_TYPE_BASE + std::min(std::max(c->cardType, 0), 6)] = 1.0f;
+  out.features[card_feat::HP] = c->hp / 400.0f;
+  out.features[card_feat::RETREAT] = std::clamp(c->retreat / 5.0f, 0.0f, 1.0f);
+  out.features[card_feat::BASIC] = c->basic ? 1.0f : 0.0f;
+  out.features[card_feat::STAGE1] = c->stage1 ? 1.0f : 0.0f;
+  out.features[card_feat::STAGE2] = c->stage2 ? 1.0f : 0.0f;
+  out.features[card_feat::EX] = c->ex ? 1.0f : 0.0f;
+  out.features[card_feat::MEGA_EX] = c->megaEx ? 1.0f : 0.0f;
+  out.features[card_feat::TERA] = c->tera ? 1.0f : 0.0f;
+  out.features[card_feat::ACE_SPEC] = c->aceSpec ? 1.0f : 0.0f;
+  out.features[card_feat::HAS_ABILITY] = c->hasAbility ? 1.0f : 0.0f;
+  out.features[card_feat::FREE_RETREAT] = c->freeRetreat ? 1.0f : 0.0f;
+  out.features[card_feat::ATTACK_COUNT] = std::clamp(c->n_attacks / 4.0f, 0.0f, 1.0f);
   int max_damage = 0;
   int min_cost = 99;
+  int min_colored = 99;
+  int max_colored = 0;
+  int total_damage = 0;
+  int damage_attacks = 0;
+  std::array<int, 4> best_damage_by_budget{};
   for (int i = 0; i < c->n_attacks; ++i) {
-    max_damage = std::max(max_damage, c->attacks[i].damage);
-    min_cost = std::min(min_cost, c->attacks[i].n_cost);
+    const AttackInfo& at = c->attacks[i];
+    max_damage = std::max(max_damage, at.damage);
+    min_cost = std::min(min_cost, at.n_cost);
+    int colored = colored_attack_cost(at);
+    min_colored = std::min(min_colored, colored);
+    max_colored = std::max(max_colored, colored);
+    total_damage += at.damage;
+    if (at.damage > 0) ++damage_attacks;
+    int budget_index = std::min(std::max(at.n_cost, 1), 4) - 1;
+    best_damage_by_budget[budget_index] =
+        std::max(best_damage_by_budget[budget_index], at.damage);
+    for (int j = 0; j < at.n_cost; ++j) {
+      int energy_idx = energy_feature_index(at.cost[j]);
+      int offset = card_feat::ATTACK_COST_TYPE_BASE + energy_idx;
+      out.features[offset] = std::min(1.0f, out.features[offset] + 0.125f);
+    }
   }
   if (min_cost == 99) min_cost = 0;
-  out.features[21] = std::clamp(max_damage / 350.0f, 0.0f, 1.0f);
-  out.features[22] = std::clamp(min_cost / 5.0f, 0.0f, 1.0f);
-  if (c->energyType >= 0 && c->energyType <= TEAM_ROCKET)
-    out.features[23] = std::clamp(c->energyType / 11.0f, 0.0f, 1.0f);
-  if (c->weakness >= 0 && c->weakness <= TEAM_ROCKET)
-    out.features[24] = std::clamp(c->weakness / 11.0f, 0.0f, 1.0f);
-  if (c->resistance >= 0 && c->resistance <= TEAM_ROCKET)
-    out.features[25] = std::clamp(c->resistance / 11.0f, 0.0f, 1.0f);
+  if (min_colored == 99) min_colored = 0;
+  int cumulative_best = 0;
+  for (int i = 0; i < 4; ++i) {
+    cumulative_best = std::max(cumulative_best, best_damage_by_budget[i]);
+    out.features[card_feat::BEST_DAMAGE_BUDGET_BASE + i] =
+        norm_damage(cumulative_best);
+  }
+  out.features[card_feat::MAX_DAMAGE] = norm_damage(max_damage);
+  out.features[card_feat::MIN_COST] = std::clamp(min_cost / 5.0f, 0.0f, 1.0f);
+  out.features[card_feat::MIN_COLORED_COST] =
+      std::clamp(min_colored / 5.0f, 0.0f, 1.0f);
+  out.features[card_feat::MAX_COLORED_COST] =
+      std::clamp(max_colored / 5.0f, 0.0f, 1.0f);
+  out.features[card_feat::MEAN_DAMAGE] =
+      c->n_attacks > 0 ? norm_damage(total_damage / c->n_attacks) : 0.0f;
+  out.features[card_feat::DAMAGE_ATTACK_COUNT] =
+      std::clamp(damage_attacks / 4.0f, 0.0f, 1.0f);
+  out.features[card_feat::ENERGY_TYPE] = norm_optional_energy_type(c->energyType);
+  out.features[card_feat::WEAKNESS] = norm_optional_energy_type(c->weakness);
+  out.features[card_feat::RESISTANCE] = norm_optional_energy_type(c->resistance);
   return out;
 }
 
@@ -621,20 +741,121 @@ static void add_static_card_features(float* f, int cid) {
 }
 
 static void add_location_features(float* f, int owner_pov, int area, int index) {
-  f[26] = owner_pov == 0 ? 1.0f : 0.0f;
-  f[27] = owner_pov == 1 ? 1.0f : 0.0f;
-  f[28] = std::clamp(area / 7.0f, 0.0f, 1.0f);
-  f[29] = std::clamp(index / 8.0f, 0.0f, 1.0f);
+  f[card_feat::OWNER_SELF] = owner_pov == 0 ? 1.0f : 0.0f;
+  f[card_feat::OWNER_OPP] = owner_pov == 1 ? 1.0f : 0.0f;
+  f[card_feat::AREA] = std::clamp(area / 7.0f, 0.0f, 1.0f);
+  f[card_feat::INDEX] = std::clamp(index / 8.0f, 0.0f, 1.0f);
+}
+
+static bool energy_satisfies_type(int available, int required) {
+  if (available == required) return true;
+  if (available == RAINBOW) return true;
+  if ((required == PSYCHIC || required == DARKNESS) &&
+      available == TEAM_ROCKET)
+    return true;
+  return false;
+}
+
+static int attack_missing_energy_units(const InPlay& p, const AttackInfo& at) {
+  std::array<int, card_feat::kEnergyTypes> pool{};
+  for (int e : p.energies)
+    pool[energy_feature_index(e)] += 1;
+
+  int colorless = 0;
+  int missing = 0;
+  for (int i = 0; i < at.n_cost; ++i) {
+    int required = at.cost[i];
+    if (required == COLORLESS) {
+      ++colorless;
+      continue;
+    }
+    int match = -1;
+    for (int e = 0; e < card_feat::kEnergyTypes; ++e) {
+      if (pool[e] > 0 && energy_satisfies_type(e, required)) {
+        match = e;
+        break;
+      }
+    }
+    if (match >= 0)
+      pool[match] -= 1;
+    else
+      ++missing;
+  }
+
+  int remaining = 0;
+  for (int n : pool) remaining += n;
+  return missing + std::max(0, colorless - remaining);
 }
 
 static void encode_inplay_slot(float* f, const InPlay& p, int owner_pov,
                                int area, int index) {
   add_static_card_features(f, p.id);
-  f[9] = p.hp / 400.0f;
-  f[30] = p.maxHp > 0 ? static_cast<float>(p.hp) / p.maxHp : 0.0f;
-  f[31] = static_cast<float>(
-              std::min(static_cast<int>(p.energies.size()), 12)) /
-          12.0f;
+  f[card_feat::HP] = p.hp / 400.0f;
+  f[card_feat::HP_RATIO] =
+      p.maxHp > 0 ? static_cast<float>(p.hp) / p.maxHp : 0.0f;
+  f[card_feat::ATTACHED_ENERGY_COUNT] =
+      norm_energy_count(std::min(static_cast<int>(p.energies.size()), 12));
+  for (int e : p.energies) {
+    int offset = card_feat::ATTACHED_ENERGY_TYPE_BASE + energy_feature_index(e);
+    f[offset] = std::min(1.0f, f[offset] + (1.0f / 12.0f));
+  }
+  f[card_feat::TOOL_COUNT] =
+      std::clamp(static_cast<float>(p.tools.size()) / 4.0f, 0.0f, 1.0f);
+  f[card_feat::PRE_EVO_COUNT] =
+      std::clamp(static_cast<float>(p.preEvo.size()) / 4.0f, 0.0f, 1.0f);
+  f[card_feat::DAMAGE_COUNTERS] =
+      std::clamp(static_cast<float>(std::max(0, p.maxHp - p.hp)) / 400.0f,
+                 0.0f, 1.0f);
+  f[card_feat::NO_ATTACK] = p.noAttackTurn >= 0 ? 1.0f : 0.0f;
+  f[card_feat::NO_RETREAT] = p.noRetreatTurn >= 0 ? 1.0f : 0.0f;
+  f[card_feat::PREVENT_DAMAGE] = p.preventDmgTurn >= 0 ? 1.0f : 0.0f;
+  f[card_feat::TAKE_MORE_DAMAGE] =
+      p.takeMoreDamageTurn >= 0 ? std::clamp(p.takeMoreDamage / 100.0f, 0.0f, 1.0f)
+                                : 0.0f;
+  int attack_delta = 0;
+  if (p.attackBonusTurn >= 0) attack_delta += p.attackBonus;
+  if (p.attackDmgReduceTurn >= 0) attack_delta -= p.attackDmgReduce;
+  f[card_feat::ATTACK_DAMAGE_DELTA] =
+      std::clamp((attack_delta + 100.0f) / 200.0f, 0.0f, 1.0f);
+  f[card_feat::DAMAGE_REDUCTION] =
+      p.dmgReduceTurn >= 0 ? std::clamp(p.dmgReduce / 100.0f, 0.0f, 1.0f)
+                           : 0.0f;
+  f[card_feat::ABILITY_USED] = p.abilityUsedThisTurn ? 1.0f : 0.0f;
+  f[card_feat::MOVED_TO_ACTIVE] = p.movedToActiveThisTurn ? 1.0f : 0.0f;
+  f[card_feat::HEALED_THIS_TURN] = p.healedThisTurn ? 1.0f : 0.0f;
+
+  const CardInfo* c = find_card(p.id);
+  if (c && c->n_attacks > 0) {
+    int ready_attacks = 0;
+    int best_ready_damage = 0;
+    int min_missing = 99;
+    int missing_for_best_damage = 99;
+    int best_damage = -1;
+    for (int i = 0; i < c->n_attacks; ++i) {
+      const AttackInfo& at = c->attacks[i];
+      int missing = attack_missing_energy_units(p, at);
+      min_missing = std::min(min_missing, missing);
+      if (missing == 0) {
+        ++ready_attacks;
+        best_ready_damage = std::max(best_ready_damage, at.damage);
+      }
+      if (at.damage > best_damage) {
+        best_damage = at.damage;
+        missing_for_best_damage = missing;
+      } else if (at.damage == best_damage) {
+        missing_for_best_damage = std::min(missing_for_best_damage, missing);
+      }
+    }
+    if (min_missing == 99) min_missing = 0;
+    if (missing_for_best_damage == 99) missing_for_best_damage = min_missing;
+    f[card_feat::READY_ATTACK_COUNT] =
+        std::clamp(ready_attacks / 4.0f, 0.0f, 1.0f);
+    f[card_feat::BEST_READY_DAMAGE] = norm_damage(best_ready_damage);
+    f[card_feat::MIN_MISSING_ATTACK_COST] =
+        std::clamp(min_missing / 5.0f, 0.0f, 1.0f);
+    f[card_feat::BEST_DAMAGE_MISSING_COST] =
+        std::clamp(missing_for_best_damage / 5.0f, 0.0f, 1.0f);
+  }
   add_location_features(f, owner_pov, area, index);
 }
 

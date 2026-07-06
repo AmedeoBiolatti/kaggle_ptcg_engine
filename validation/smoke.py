@@ -57,8 +57,13 @@ def main() -> int:
     if obs is None:
         raise RuntimeError(f"battle_start failed: errorType={start.errorType}")
     print("start context:", obs["select"]["context"])
-    obs = battle_select([0])
-    print("next turn/context:", obs["current"]["turn"], obs["select"]["context"])
+    for _ in range(20):
+        if int(obs["current"]["turn"]) > 0:
+            break
+        select = obs["select"]
+        choice = [] if int(select["minCount"]) == 0 else [0]
+        obs = battle_select(choice)
+    print("main turn/context:", obs["current"]["turn"], obs["select"]["context"])
     battle_finish()
     return 0
 

@@ -5,8 +5,9 @@ This module intentionally mirrors the small battle-loop surface from
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
+import random
 import sys
 from collections import Counter
 
@@ -28,12 +29,37 @@ class NativeStartData:
 class NativeBattle:
     battle = None
     state = None
+    setup = None
     obs = None
     last_logs: list[dict] = []
     deck0: list[int] | None = None
     deck1: list[int] | None = None
     seed: int = 1
     generation: int = 0
+
+
+@dataclass
+class _SetupPlayer:
+    deck: list[int]
+    hand: list[int] = field(default_factory=list)
+    prize: list[int] = field(default_factory=list)
+    active: int | None = None
+    bench: list[int] = field(default_factory=list)
+    bench_choices: list[int] = field(default_factory=list)
+    mulligans: int = 0
+
+
+@dataclass
+class _SetupState:
+    players: list[_SetupPlayer]
+    rng: random.Random
+    first_player: int = -1
+    phase: str = "choose_first"
+    select_player: int = 0
+    active_order: list[int] = field(default_factory=list)
+    active_done: set[int] = field(default_factory=set)
+    bonus_pos: int = 0
+    bench_pos: int = 0
 
 
 def _engine():
@@ -43,10 +69,10 @@ def _engine():
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     build_dirs = [
         os.path.join(root, "engine"),
-        os.path.join(root, "engine", "build", "Release"),
         os.path.join(root, "engine", "build"),
+        os.path.join(root, "engine", "build", "Release"),
     ]
-    for build_dir in reversed(build_dirs):
+    for build_dir in build_dirs:
         if os.path.isdir(build_dir):
             while build_dir in sys.path:
                 sys.path.remove(build_dir)
@@ -137,6 +163,80 @@ def _observation(logs: list[dict] | None = None) -> dict:
 
 def _ids(cards) -> list[int]:
     return [int(c["id"]) for c in cards or [] if c is not None and c.get("id") is not None]
+
+
+_CARD_LOOKUP_CACHE = None
+
+
+def _card_lookup() -> dict[int, object]:
+    global _CARD_LOOKUP_CACHE
+    if _CARD_LOOKUP_CACHE is None:
+        from ptcg.cg.api import _native_all_card_data
+
+        _CARD_LOOKUP_CACHE = {int(card.cardId): card for card in _native_all_card_data()}
+    return _CARD_LOOKUP_CACHE
+
+
+def _card_info(card_id: int):
+    return _card_lookup().get(int(card_id))
+
+
+def _is_basic_pokemon(card_id: int) -> bool:
+    from ptcg.cg.api import CardType
+
+    card = _card_info(card_id)
+    return (
+        card is not None
+        and int(card.cardType) == int(CardType.POKEMON)
+        and bool(card.basic)
+    )
+
+
+def _card_dict(card_id: int, player: int, serial: int = 0) -> dict:
+    return {"id": int(card_id), "serial": int(serial), "playerIndex": int(player)}
+
+
+def _pokemon_dict(card_id: int, player: int, serial: int = 0) -> dict:
+    card = _card_info(card_id)
+    hp = int(card.hp) if card is not None else 0
+    return {
+        "id": int(card_id),
+        "serial": int(serial),
+        "playerIndex": int(player),
+        "hp": hp,
+        "maxHp": hp,
+        "appearThisTurn": False,
+        "energies": [],
+        "energyCards": [],
+        "tools": [],
+        "preEvolution": [],
+    }
+
+
+def _deck_validation_error(deck0: list[int], deck1: list[int]) -> tuple[int, int]:
+    from ptcg.cg.api import CardType, _native_all_card_data
+
+    cards = {int(card.cardId): card for card in _native_all_card_data()}
+    for player, deck in enumerate((deck0, deck1)):
+        name_count: Counter[str] = Counter()
+        ace_spec = False
+        basic = False
+        for raw_id in deck:
+            card = cards.get(int(raw_id))
+            if card is None:
+                return player, 1
+            if bool(card.aceSpec):
+                if ace_spec:
+                    return player, 4
+                ace_spec = True
+            if int(card.cardType) == int(CardType.POKEMON) and bool(card.basic):
+                basic = True
+            name_count[str(card.name)] += 1
+            if name_count[str(card.name)] > 4 and int(card.cardType) != int(CardType.BASIC_ENERGY):
+                return player, 2
+        if not basic:
+            return player, 3
+    return -1, 0
 
 
 def _active_id(player: dict) -> int | None:
@@ -285,6 +385,412 @@ def _action_logs(before: dict, after: dict, descriptor: tuple | None,
     return logs
 
 
+def _official_setup_enabled() -> bool:
+    return os.environ.get("PTCG_NATIVE_FAST_SETUP", "").lower() not in {"1", "true", "yes"}
+
+
+def _has_basic(hand: list[int]) -> bool:
+    return any(_is_basic_pokemon(card_id) for card_id in hand)
+
+
+def _setup_card_options(setup: _SetupState, player: int, *, bench: bool) -> list[tuple[int, int]]:
+    player_state = setup.players[player]
+    room = max(0, 5 - len(player_state.bench_choices)) if bench else 1
+    if room <= 0:
+        return []
+    return [
+        (idx, card_id)
+        for idx, card_id in enumerate(player_state.hand)
+        if _is_basic_pokemon(card_id)
+    ]
+
+
+def _setup_descriptors(setup: _SetupState) -> tuple[int, list[tuple]]:
+    if setup.phase == "choose_first":
+        return 41, [("YES",), ("NO",)]
+    if setup.phase == "active":
+        player = setup.select_player
+        return 1, [("SETUP_ACTIVE", card_id) for _idx, card_id in _setup_card_options(setup, player, bench=False)]
+    if setup.phase == "bonus":
+        max_bonus = setup.players[1 - setup.select_player].mulligans
+        return 38, [("COUNT", n) for n in range(max_bonus + 1)]
+    if setup.phase == "bench":
+        player = setup.select_player
+        return 2, [("CARD", "HAND", idx, card_id) for idx, card_id in _setup_card_options(setup, player, bench=True)]
+    return 0, [("END",)]
+
+
+def _setup_public_player(setup: _SetupState, player: int, viewer: int) -> dict:
+    player_state = setup.players[player]
+    active = [None] if player_state.active is not None else []
+    hand = (
+        [_card_dict(card_id, player, serial=idx) for idx, card_id in enumerate(player_state.hand)]
+        if player == viewer else None
+    )
+    return {
+        "active": active,
+        "bench": [],
+        "benchMax": 5,
+        "deck": [],
+        "deckCount": len(player_state.deck),
+        "discard": [],
+        "prize": [None for _ in player_state.prize],
+        "handCount": len(player_state.hand),
+        "hand": hand,
+        "poisoned": False,
+        "burned": False,
+        "asleep": False,
+        "paralyzed": False,
+        "confused": False,
+    }
+
+
+def _setup_current(setup: _SetupState) -> dict:
+    viewer = int(setup.select_player)
+    return {
+        "turn": 0,
+        "turnActionCount": 0,
+        "yourIndex": viewer,
+        "firstPlayer": int(setup.first_player),
+        "supporterPlayed": False,
+        "stadiumPlayed": False,
+        "energyAttached": False,
+        "retreated": False,
+        "result": -1,
+        "stadium": [],
+        "looking": None,
+        "players": [
+            _setup_public_player(setup, 0, viewer),
+            _setup_public_player(setup, 1, viewer),
+        ],
+    }
+
+
+def _setup_select_data(setup: _SetupState) -> tuple[dict, list[tuple]]:
+    context, descriptors = _setup_descriptors(setup)
+    options: list[dict] = []
+    min_count = 1
+    max_count = 1
+    select_type = 1
+    if setup.phase == "choose_first":
+        select_type = 9
+        options = [{"type": 1}, {"type": 2}]
+    elif setup.phase == "active":
+        player = setup.select_player
+        options = [
+            {"type": 3, "area": 2, "index": idx, "playerIndex": player}
+            for idx, _card_id in _setup_card_options(setup, player, bench=False)
+        ]
+    elif setup.phase == "bonus":
+        select_type = 8
+        max_bonus = setup.players[1 - setup.select_player].mulligans
+        options = [{"type": 0, "number": n} for n in range(max_bonus + 1)]
+    elif setup.phase == "bench":
+        player = setup.select_player
+        card_options = _setup_card_options(setup, player, bench=True)
+        min_count = 0
+        max_count = min(5 - len(setup.players[player].bench_choices), len(card_options))
+        options = [
+            {"type": 3, "area": 2, "index": idx, "playerIndex": player}
+            for idx, _card_id in card_options
+        ]
+    select = {
+        "context": context,
+        "type": select_type,
+        "contextCard": None,
+        "minCount": min_count,
+        "maxCount": max_count,
+        "remainDamageCounter": 0,
+        "remainEnergyCost": 0,
+        "effect": None,
+        "deck": None,
+        "option": options,
+    }
+    return select, descriptors
+
+
+def _setup_obs(logs: list[dict] | None = None) -> dict:
+    setup = NativeBattle.setup
+    if setup is None:
+        raise ValueError("setup is not active")
+    select, descriptors = _setup_select_data(setup)
+    obs = {
+        "current": _setup_current(setup),
+        "select": select,
+        "logs": list(logs or []),
+        "search_begin_input": None,
+    }
+    context, _ = _setup_descriptors(setup)
+    obs["search_begin_input"] = encode_native_search_begin(
+        obs["current"],
+        context=int(context),
+        descriptors=descriptors,
+        seed=NativeBattle.seed,
+        portable=_portable_search_payload(),
+    )
+    NativeBattle.obs = obs
+    NativeBattle.last_logs = list(logs or [])
+    return obs
+
+
+def _setup_private_player(setup: _SetupState, player: int) -> dict:
+    player_state = setup.players[player]
+    return {
+        "active": (
+            [_pokemon_dict(player_state.active, player)]
+            if player_state.active is not None else []
+        ),
+        "bench": [
+            _pokemon_dict(card_id, player, serial=idx)
+            for idx, card_id in enumerate(player_state.bench)
+        ],
+        "benchMax": 5,
+        "deck": list(player_state.deck),
+        "deckKnown": False,
+        "deckKnownMask": [False for _ in player_state.deck],
+        "deckCount": len(player_state.deck),
+        "discard": [],
+        "prize": [
+            _card_dict(card_id, player, serial=idx)
+            for idx, card_id in enumerate(player_state.prize)
+        ],
+        "prizesKnown": False,
+        "prizesKnownMask": [False for _ in player_state.prize],
+        "prizeFaceUp": [False for _ in player_state.prize],
+        "handCount": len(player_state.hand),
+        "hand": [
+            _card_dict(card_id, player, serial=idx)
+            for idx, card_id in enumerate(player_state.hand)
+        ],
+        "poisoned": False,
+        "burned": False,
+        "asleep": False,
+        "paralyzed": False,
+        "confused": False,
+    }
+
+
+def _setup_private_current(setup: _SetupState) -> dict:
+    first = int(setup.first_player)
+    return {
+        "turn": 1,
+        "turnActionCount": 1,
+        "yourIndex": first,
+        "firstPlayer": first,
+        "supporterPlayed": False,
+        "stadiumPlayed": False,
+        "energyAttached": False,
+        "retreated": False,
+        "result": -1,
+        "stadium": [],
+        "looking": None,
+        "players": [
+            _setup_private_player(setup, 0),
+            _setup_private_player(setup, 1),
+        ],
+    }
+
+
+def _setup_events_to_logs(events: list[tuple], viewer: int) -> list[dict]:
+    logs: list[dict] = []
+    for event in events:
+        kind = event[0]
+        if kind == "draw":
+            _kind, player, card_id = event
+            if int(player) == int(viewer):
+                logs.append(_log(4, **_card_log(card_id, player)))
+            else:
+                logs.append(_log(5, playerIndex=player))
+        elif kind == "has_basic":
+            _kind, player, has_basic = event
+            logs.append(_log(1, playerIndex=player, hasBasicPokemon=bool(has_basic)))
+        elif kind == "shuffle":
+            _kind, player = event
+            logs.append(_log(0, playerIndex=player))
+        elif kind == "move":
+            _kind, player, card_id, from_area, to_area = event
+            if int(player) == int(viewer) and int(card_id) > 0:
+                logs.append(_log(6, **_card_log(card_id, player, fromArea=from_area, toArea=to_area)))
+            else:
+                logs.append(_log(7, playerIndex=player, fromArea=from_area, toArea=to_area))
+        elif kind == "turn_start":
+            _kind, player = event
+            logs.append(_log(2, playerIndex=player))
+    return logs
+
+
+def _setup_draw(setup: _SetupState, player: int, count: int, events: list[tuple]) -> None:
+    player_state = setup.players[player]
+    for _ in range(int(count)):
+        if not player_state.deck:
+            break
+        card_id = player_state.deck.pop()
+        player_state.hand.append(card_id)
+        events.append(("draw", player, card_id))
+
+
+def _setup_mulligan_until_basic(setup: _SetupState, player: int, events: list[tuple]) -> None:
+    player_state = setup.players[player]
+    while not _has_basic(player_state.hand):
+        for card_id in list(player_state.hand):
+            events.append(("move", player, card_id, 2, 1))
+        player_state.deck.extend(player_state.hand)
+        player_state.hand.clear()
+        setup.rng.shuffle(player_state.deck)
+        player_state.mulligans += 1
+        events.append(("shuffle", player))
+        _setup_draw(setup, player, 7, events)
+        events.append(("has_basic", player, _has_basic(player_state.hand)))
+
+
+def _setup_initial_draw(setup: _SetupState, events: list[tuple]) -> None:
+    for player_state in setup.players:
+        setup.rng.shuffle(player_state.deck)
+    for player in (0, 1):
+        _setup_draw(setup, player, 7, events)
+    for player in (0, 1):
+        events.append(("has_basic", player, _has_basic(setup.players[player].hand)))
+
+
+def _setup_deal_prizes(setup: _SetupState, events: list[tuple]) -> None:
+    for player, player_state in enumerate(setup.players):
+        if player_state.prize:
+            continue
+        for _ in range(6):
+            if not player_state.deck:
+                break
+            card_id = player_state.deck.pop()
+            player_state.prize.append(card_id)
+            events.append(("move", player, card_id, 1, 6))
+
+
+def _setup_advance_active(setup: _SetupState, events: list[tuple]) -> None:
+    while True:
+        for player in setup.active_order:
+            if player not in setup.active_done and _has_basic(setup.players[player].hand):
+                setup.phase = "active"
+                setup.select_player = player
+                return
+        for player in setup.active_order:
+            if player not in setup.active_done:
+                _setup_mulligan_until_basic(setup, player, events)
+                setup.phase = "active"
+                setup.select_player = player
+                return
+        _setup_deal_prizes(setup, events)
+        setup.phase = "bonus"
+        setup.bonus_pos = 0
+        _setup_advance_bonus_or_bench(setup, events)
+        return
+
+
+def _setup_advance_bonus_or_bench(setup: _SetupState, events: list[tuple]) -> None:
+    while setup.bonus_pos < len(setup.active_order):
+        player = setup.active_order[setup.bonus_pos]
+        if setup.players[1 - player].mulligans > 0:
+            setup.phase = "bonus"
+            setup.select_player = player
+            return
+        setup.bonus_pos += 1
+    setup.phase = "bench"
+    setup.bench_pos = 0
+    _setup_advance_bench(setup, events)
+
+
+def _setup_advance_bench(setup: _SetupState, events: list[tuple]) -> None:
+    while setup.bench_pos < len(setup.active_order):
+        player = setup.active_order[setup.bench_pos]
+        if _setup_card_options(setup, player, bench=True):
+            setup.phase = "bench"
+            setup.select_player = player
+            return
+        setup.bench_pos += 1
+    _setup_complete(setup, events)
+
+
+def _setup_complete(setup: _SetupState, events: list[tuple]) -> None:
+    for player in setup.active_order:
+        player_state = setup.players[player]
+        selected = [
+            (idx, player_state.hand[idx])
+            for idx in player_state.bench_choices
+            if 0 <= idx < len(player_state.hand)
+        ]
+        for idx, _card_id in sorted(selected, reverse=True):
+            player_state.hand.pop(idx)
+        for _idx, card_id in selected:
+            player_state.bench.append(card_id)
+            events.append(("move", player, card_id, 2, 5))
+
+    first = setup.first_player
+    events.append(("turn_start", first))
+    _setup_draw(setup, first, 1, events)
+
+    E = _engine()
+    NativeBattle.state = E.load_state(_setup_private_current(setup), NativeBattle.seed, None)
+    NativeBattle.setup = None
+    obs, context, descriptors = E.cg_observation_with_view(NativeBattle.state)
+    logs = _setup_events_to_logs(events, int(obs["current"]["yourIndex"]))
+    NativeBattle.last_logs = logs
+    obs["logs"] = logs
+    _attach_search_begin_input(E, obs, int(context), descriptors)
+    NativeBattle.obs = obs
+
+
+def _setup_validate_selection(select_list: list[int], min_count: int, max_count: int, n_options: int) -> None:
+    if not isinstance(select_list, list) or not all(isinstance(i, int) for i in select_list):
+        raise ValueError("select_list is not list[int]")
+    if not (min_count <= len(select_list) <= max_count):
+        raise ValueError("Must be Observation.select.minCount <= len(select) <= Observation.select.maxCount.")
+    if any(i < 0 or i >= n_options for i in select_list):
+        raise IndexError()
+    if len(set(select_list)) != len(select_list):
+        raise ValueError("Duplicate select elements.")
+
+
+def _setup_select(select_list: list[int]) -> dict:
+    setup = NativeBattle.setup
+    if setup is None:
+        raise ValueError("setup is not active")
+    select, _descriptors = _setup_select_data(setup)
+    options = list(select["option"])
+    _setup_validate_selection(select_list, int(select["minCount"]), int(select["maxCount"]), len(options))
+    events: list[tuple] = []
+
+    if setup.phase == "choose_first":
+        setup.first_player = 0 if int(select_list[0]) == 0 else 1
+        setup.active_order = [setup.first_player, 1 - setup.first_player]
+        _setup_initial_draw(setup, events)
+        _setup_advance_active(setup, events)
+    elif setup.phase == "active":
+        player = setup.select_player
+        card_options = _setup_card_options(setup, player, bench=False)
+        hand_index, card_id = card_options[int(select_list[0])]
+        setup.players[player].hand.pop(hand_index)
+        setup.players[player].active = card_id
+        setup.active_done.add(player)
+        events.append(("move", player, card_id, 2, 4))
+        _setup_advance_active(setup, events)
+    elif setup.phase == "bonus":
+        player = setup.select_player
+        number = int(options[int(select_list[0])]["number"])
+        _setup_draw(setup, player, number, events)
+        setup.bonus_pos += 1
+        _setup_advance_bonus_or_bench(setup, events)
+    elif setup.phase == "bench":
+        player = setup.select_player
+        card_options = _setup_card_options(setup, player, bench=True)
+        setup.players[player].bench_choices = [card_options[int(i)][0] for i in select_list]
+        setup.bench_pos += 1
+        _setup_advance_bench(setup, events)
+    else:
+        raise IndexError()
+
+    if NativeBattle.setup is None:
+        return NativeBattle.obs
+    return _setup_obs(_setup_events_to_logs(events, setup.select_player))
+
+
 def _step_exact(state, select_list: list[int]) -> None:
     E = _engine()
     pending = E.pending_decision(state)
@@ -314,7 +820,30 @@ def battle_start(deck0: list[int], deck1: list[int]) -> tuple[dict | None, Nativ
     NativeBattle.deck1 = list(deck1)
     NativeBattle.seed = _seed()
     NativeBattle.generation = 0
+    error_player, error_type = _deck_validation_error(NativeBattle.deck0, NativeBattle.deck1)
+    if error_type:
+        NativeBattle.battle = None
+        NativeBattle.state = None
+        NativeBattle.setup = None
+        return None, NativeStartData(
+            battlePtr=None,
+            errorPlayer=error_player,
+            errorType=error_type,
+        )
     try:
+        if _official_setup_enabled() and not _cpp_battle_enabled():
+            NativeBattle.battle = None
+            NativeBattle.state = None
+            NativeBattle.setup = _SetupState(
+                players=[
+                    _SetupPlayer(deck=list(NativeBattle.deck0)),
+                    _SetupPlayer(deck=list(NativeBattle.deck1)),
+                ],
+                rng=random.Random(NativeBattle.seed or 1),
+            )
+            NativeBattle.last_logs = []
+            obs = _setup_obs([])
+            return obs, NativeStartData(battlePtr=1, errorPlayer=-1, errorType=0)
         if _cpp_battle_enabled():
             NativeBattle.battle = E.NativeCgBattle()
             obs, context, descriptors, engine_logs = NativeBattle.battle.start(
@@ -338,6 +867,7 @@ def battle_start(deck0: list[int], deck1: list[int]) -> tuple[dict | None, Nativ
     except Exception:
         NativeBattle.battle = None
         NativeBattle.state = None
+        NativeBattle.setup = None
         return None, NativeStartData(battlePtr=None, errorPlayer=-1, errorType=1)
     obs["logs"] = NativeBattle.last_logs
     _attach_search_begin_input(E, obs, int(context), descriptors)
@@ -352,6 +882,7 @@ def battle_finish() -> None:
         NativeBattle.battle.finish()
     NativeBattle.state = None
     NativeBattle.battle = None
+    NativeBattle.setup = None
     NativeBattle.obs = None
     NativeBattle.deck0 = None
     NativeBattle.deck1 = None
@@ -370,6 +901,8 @@ def battle_select(select_list: list[int]) -> dict:
     if not isinstance(select_list, list) or not all(isinstance(i, int) for i in select_list):
         raise ValueError("select_list is not list[int]")
     if NativeBattle.state is None:
+        if NativeBattle.setup is not None:
+            return _setup_select(select_list)
         raise ValueError("battle_ptr broken.")
 
     try:

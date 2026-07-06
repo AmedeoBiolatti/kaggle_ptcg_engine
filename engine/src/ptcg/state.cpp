@@ -8863,9 +8863,9 @@ SmallVec<int, 24> provided_energy_units(const InPlay& pk,
   return units;
 }
 
-static int provided_energy_units_for_card(const InPlay& pk, int energyIdx,
-                                          const GameState* st = nullptr,
-                                          int ownerSide = -1) {
+int provided_energy_units_for_card(const InPlay& pk, int energyIdx,
+                                   const GameState* st,
+                                   int ownerSide) {
   if (energyIdx < 0 || energyIdx >= static_cast<int>(pk.energyCardIds.size()))
     return 1;
   int id = pk.energyCardIds[energyIdx];
@@ -11233,7 +11233,14 @@ static bool set_froslass_checkup_pending(GameState& st,
 
 static void pokemon_checkup(GameState& st, int endingPlayer,
                             bool deferPoisonDamage) {
-  for (int who : {1 - endingPlayer, endingPlayer}) {
+  // cabt resolves the Checkup in phases across BOTH Active Pokemon, in game
+  // first-player order: status-immunity clears + Poison damage, then every Burn
+  // (damage + cure coin), then every Sleep (wake coin), then Paralysis. Keeping
+  // the coin flips phase-separated and first-player-ordered matches the order
+  // cabt consumes coins, so replayed coin tapes stay aligned.
+  int first = st.firstPlayer >= 0 ? st.firstPlayer : endingPlayer;
+  int order[2] = {first, 1 - first};
+  for (int who : order) {
     Player& p = st.players[who];
     if (!p.activeKnown) continue;
     if (is_antique_fossil(p.active.id))
@@ -11242,13 +11249,20 @@ static void pokemon_checkup(GameState& st, int endingPlayer,
       clear_status(p);
     if (p.poisoned && !deferPoisonDamage)
       apply_poison_checkup_damage(st, who);
-    if (p.burned) {
-      int extraCounters = 3 * in_play_count_id(st.players[1 - who], 256);
-      p.active.hp -= 20 + 10 * extraCounters;
-      if (flip_heads(st)) p.burned = false;  // heads cures Burn
-    }
     if (p.active.hp < 0) p.active.hp = 0;
-    if (p.asleep && flip_heads(st)) p.asleep = false;  // heads wakes up
+  }
+  for (int who : order) {  // Burn: 20 (+extra) damage, then a cure coin
+    Player& p = st.players[who];
+    if (!p.activeKnown || !p.burned) continue;
+    int extraCounters = 3 * in_play_count_id(st.players[1 - who], 256);
+    p.active.hp -= 20 + 10 * extraCounters;
+    if (p.active.hp < 0) p.active.hp = 0;
+    if (flip_heads(st)) p.burned = false;  // heads cures Burn
+  }
+  for (int who : order) {  // Sleep: a wake coin
+    Player& p = st.players[who];
+    if (!p.activeKnown || !p.asleep) continue;
+    if (flip_heads(st)) p.asleep = false;  // heads wakes up
   }
   st.players[endingPlayer].paralyzed = false;  // clears at its owner's Checkup
   if (!deferPoisonDamage)
@@ -12416,16 +12430,25 @@ void apply(GameState& st, const Action& a, const std::vector<int>& tape) {
       emit_log(st, attackLog);
       st.checkupKoFirst = -1;
       st.turnActionCount += 1;  // the attack counts as an action
-      if (me.confused && !flip_heads(st)) {  // Confusion: tails -> attack fails,
-        if (me.activeKnown) {                // and the Active hits itself for 30
+      // Festival Lead's second attack re-enters here; cabt's second-attack path
+      // skips the pre-attack coin flips, so suppress them on the follow-up.
+      bool festivalFollowupAttack =
+          st.festivalLeadAttackTurn[st.yourIndex] == st.turn;
+      // cabt order: flip the "flip or the attack fails" coin FIRST; Confusion is
+      // only checked if it passes. A failed attack-coin ends the attack cleanly
+      // (no Confusion self-damage).
+      if (!festivalFollowupAttack &&
+          me.active.attackFlipFailTurn == st.turn && !flip_heads(st)) {
+        post_attack(st, st.yourIndex);
+        break;
+      }
+      if (!festivalFollowupAttack && me.confused &&
+          !flip_heads(st)) {         // Confusion: tails -> attack fails, and the
+        if (me.activeKnown) {        // Active hits itself for 30
           me.active.hp -= 30;
           if (me.active.hp < 0) me.active.hp = 0;
         }
         post_attack(st, 1 - st.yourIndex);  // a self-KO gives the opponent a prize
-        break;
-      }
-      if (me.active.attackFlipFailTurn == st.turn && !flip_heads(st)) {
-        post_attack(st, st.yourIndex);
         break;
       }
       st.discardedCount = 0;
