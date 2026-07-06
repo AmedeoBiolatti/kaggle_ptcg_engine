@@ -1018,13 +1018,15 @@ def bench_native_ppo_jax(
     full_scan_update: bool = False,
     epoch_scan_update: bool = True,
     diagnostic: str = "full",
+    custom_embedding_backward: bool = False,
+    compact_card_vocab: bool = True,
 ) -> tuple[int, int, float, dict[str, Any]]:
     _clear_native_modules()
     _prefer_native_paths()
     import jax
     import jax.numpy as jnp
     import ptcg_engine as E
-    from ptcg.jax_nn import forward_policy_value, init_params
+    from ptcg.jax_nn import forward_policy_value, init_compact_params, init_params
 
     if not hasattr(E.VectorEnv, "observe_ids_into"):
         raise RuntimeError("VectorEnv.observe_ids_into is not available in this build")
@@ -1050,7 +1052,17 @@ def bench_native_ppo_jax(
     logprobs = np.empty((rollout_steps, batch_size), dtype=np.float32)
     values = np.empty((rollout_steps, batch_size), dtype=np.float32)
 
-    params = init_params(jax.random.PRNGKey(seed), card_dim=card_dim, hidden_dim=hidden_dim)
+    if compact_card_vocab:
+        params, card_id_remap = init_compact_params(
+            jax.random.PRNGKey(seed),
+            [*deck0, *deck1],
+            card_dim=card_dim,
+            hidden_dim=hidden_dim,
+        )
+        card_id_remap = jnp.asarray(card_id_remap, dtype=jnp.int32)
+    else:
+        params = init_params(jax.random.PRNGKey(seed), card_dim=card_dim, hidden_dim=hidden_dim)
+        card_id_remap = None
     mixed_dtype = {
         "bf16": jnp.bfloat16,
         "fp16": jnp.float16,
@@ -1087,7 +1099,59 @@ def bench_native_ppo_jax(
         )
         return p, {"m": m, "v": v, "t": t}
 
-    infer = jax.jit(forward_policy_value)
+    def forward_model(
+        p,
+        in_play,
+        zones,
+        player_counts,
+        player_status,
+        global_,
+        options,
+        mask,
+    ):
+        return forward_policy_value(
+            p,
+            in_play,
+            zones,
+            player_counts,
+            player_status,
+            global_,
+            options,
+            mask,
+            custom_embedding_backward=custom_embedding_backward,
+            card_id_remap=card_id_remap,
+        )
+
+    infer = jax.jit(forward_model)
+
+    @jax.jit
+    def sample_policy(
+        p,
+        key,
+        in_play,
+        zones,
+        player_counts,
+        player_status,
+        global_,
+        options,
+        mask,
+    ):
+        key, sample_key = jax.random.split(key)
+        out = forward_model(
+            p,
+            in_play,
+            zones,
+            player_counts,
+            player_status,
+            global_,
+            options,
+            mask,
+        )
+        logits = out["logits"].astype(jnp.float32)
+        actions = jax.random.categorical(sample_key, logits, axis=-1).astype(jnp.int32)
+        logp_all = jax.nn.log_softmax(logits, axis=-1)
+        logprobs = jnp.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(1)
+        return key, actions, logprobs, out["value"].astype(jnp.float32)
 
     def ppo_loss(
         p,
@@ -1103,7 +1167,7 @@ def bench_native_ppo_jax(
         advantages_,
         returns_,
     ):
-        out = forward_policy_value(
+        out = forward_model(
             p,
             in_play,
             zones,
@@ -1128,6 +1192,21 @@ def bench_native_ppo_jax(
         total_loss = policy_loss + vf_coef * value_loss - ent_coef * entropy
         metrics = jnp.array([policy_loss, value_loss, entropy, total_loss], dtype=jnp.float32)
         return total_loss, metrics
+
+    frozen_embedding_keys = frozenset((
+        "card_embedding",
+        "role_gate",
+        "attack_embedding",
+        "kind_embedding",
+        "type_embedding",
+        "area_embedding",
+    ))
+
+    def freeze_embedding_params(p):
+        return {
+            key: jax.lax.stop_gradient(value) if key in frozen_embedding_keys else value
+            for key, value in p.items()
+        }
 
     @jax.jit
     def ppo_step(
@@ -1230,6 +1309,45 @@ def bench_native_ppo_jax(
         return metrics.at[3].set(metrics[3] + grad_sum * jnp.array(1e-20, dtype=jnp.float32))
 
     @jax.jit
+    def ppo_backward_heads_only(
+        params,
+        in_play,
+        zones,
+        player_counts,
+        player_status,
+        global_,
+        options,
+        mask,
+        actions,
+        old_logprobs,
+        advantages_,
+        returns_,
+    ):
+        def loss_fn(p):
+            return ppo_loss(
+                freeze_embedding_params(p),
+                in_play,
+                zones,
+                player_counts,
+                player_status,
+                global_,
+                options,
+                mask,
+                actions,
+                old_logprobs,
+                advantages_,
+                returns_,
+            )
+
+        (_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        grad_sum = jax.tree_util.tree_reduce(
+            lambda acc, value: acc + jnp.sum(value.astype(jnp.float32) * value.astype(jnp.float32)),
+            grads,
+            initializer=jnp.array(0.0, dtype=jnp.float32),
+        )
+        return metrics.at[3].set(metrics[3] + grad_sum * jnp.array(1e-20, dtype=jnp.float32))
+
+    @jax.jit
     def ppo_adam_only(params, opt_state, grads):
         params, opt_state = adam_update(params, grads, opt_state)
         leaf_sum = jax.tree_util.tree_reduce(
@@ -1291,11 +1409,12 @@ def bench_native_ppo_jax(
         (params, opt_state), metrics = jax.lax.scan(step, (params, opt_state), indices)
         return params, opt_state, metrics[-1]
 
-    rng = np.random.default_rng(seed)
+    rollout_key = jax.random.PRNGKey(seed + 17)
     with precision_ctx:
         env.observe_ids_into(state_np, action_np, player, result)
-        warm = infer(
+        rollout_key, warm_actions, warm_logprobs, warm_values = sample_policy(
             params,
+            rollout_key,
             jnp.asarray(state_np["in_play"]),
             jnp.asarray(state_np["zones"]),
             jnp.asarray(state_np["player_counts"]),
@@ -1304,7 +1423,7 @@ def bench_native_ppo_jax(
             jnp.asarray(action_np["options"]),
             jnp.asarray(action_np["mask"]),
         )
-        jax.block_until_ready(warm)
+        jax.block_until_ready((rollout_key, warm_actions, warm_logprobs, warm_values))
 
         rollout_start = time.perf_counter()
         for t in range(rollout_steps):
@@ -1313,8 +1432,9 @@ def bench_native_ppo_jax(
                 state_buf[key][t] = state_np[key]
             for key in action_buf:
                 action_buf[key][t] = action_np[key]
-            out = infer(
+            rollout_key, action_t, logprob_t, value_t = sample_policy(
                 params,
+                rollout_key,
                 jnp.asarray(state_np["in_play"]),
                 jnp.asarray(state_np["zones"]),
                 jnp.asarray(state_np["player_counts"]),
@@ -1323,18 +1443,15 @@ def bench_native_ppo_jax(
                 jnp.asarray(action_np["options"]),
                 jnp.asarray(action_np["mask"]),
             )
-            logits = np.asarray(jax.device_get(out["logits"]), dtype=np.float32)
-            logits = logits - logits.max(axis=1, keepdims=True)
-            probs = np.exp(logits)
-            probs /= probs.sum(axis=1, keepdims=True)
-            actions = np.array([rng.choice(probs.shape[1], p=row) for row in probs], dtype=np.int32)
+            actions, logprob_np, value_np = jax.device_get((action_t, logprob_t, value_t))
+            actions = np.asarray(actions, dtype=np.int32)
             _obs, reward, done, _mask, _player, _result = env.step(actions)
             rewards[t] = np.asarray(reward, dtype=np.float32)
             dones[t] = np.asarray(done, dtype=np.float32)
             actions_buf[t] = actions
-            logprobs[t] = np.log(np.take_along_axis(probs, actions[:, None], axis=1).squeeze(1) + 1e-8)
-            values[t] = np.asarray(jax.device_get(out["value"]), dtype=np.float32)
-        jax.block_until_ready(out)
+            logprobs[t] = np.asarray(logprob_np, dtype=np.float32)
+            values[t] = np.asarray(value_np, dtype=np.float32)
+        jax.block_until_ready(rollout_key)
         rollout_seconds = time.perf_counter() - rollout_start
 
         env.observe_ids_into(state_np, action_np, player, result)
@@ -1420,6 +1537,25 @@ def bench_native_ppo_jax(
                     batch["returns"][mb],
                 )
             update_mode = "diagnostic_backward_no_adam"
+        elif diagnostic == "backward_heads_only":
+            last = jnp.zeros((4,), dtype=jnp.float32)
+            for mb_np in indices:
+                mb = jnp.asarray(mb_np, dtype=jnp.int32)
+                last = ppo_backward_heads_only(
+                    params,
+                    batch["in_play"][mb],
+                    batch["zones"][mb],
+                    batch["player_counts"][mb],
+                    batch["player_status"][mb],
+                    batch["global"][mb],
+                    batch["options"][mb],
+                    batch["mask"][mb],
+                    batch["actions"][mb],
+                    batch["old_logprobs"][mb],
+                    batch["advantages"][mb],
+                    batch["returns"][mb],
+                )
+            update_mode = "diagnostic_backward_heads_only"
         elif full_scan_update:
             params, opt_state, last = ppo_update(params, opt_state, batch, jnp.asarray(indices, dtype=jnp.int32))
             update_mode = "fullscan"
@@ -1475,6 +1611,8 @@ def bench_native_ppo_jax(
         "compiled": True,
         "update_mode": update_mode,
         "contiguous_mb": epoch_scan_update and not full_scan_update,
+        "custom_emb_bwd": custom_embedding_backward,
+        "compact_cards": compact_card_vocab,
         "mixed": mixed_precision if mixed_dtype is not None else "off",
         "policy_loss": float(last_np[0]),
         "value_loss": float(last_np[1]),
@@ -1787,6 +1925,8 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 mixed_precision=args.nn_mixed_precision,
                 full_scan_update=args.ppo_jax_update_mode == "fullscan",
                 epoch_scan_update=args.ppo_jax_update_mode == "epochscan",
+                custom_embedding_backward=args.jax_custom_embedding_backward,
+                compact_card_vocab=args.ppo_jax_compact_cards,
             ),
         ),
         (
@@ -1810,6 +1950,7 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 matmul_precision=args.jax_matmul_precision,
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="forward_only",
+                compact_card_vocab=args.ppo_jax_compact_cards,
             ),
         ),
         (
@@ -1833,6 +1974,56 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 matmul_precision=args.jax_matmul_precision,
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="backward_no_adam",
+                compact_card_vocab=args.ppo_jax_compact_cards,
+            ),
+        ),
+        (
+            "diagnostic_jax_ppo_backward_heads_only",
+            lambda: bench_native_ppo_jax(
+                deck0,
+                deck1,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                rollout_steps=args.ppo_rollout_steps,
+                minibatch_size=args.ppo_minibatch_size,
+                epochs=args.ppo_epochs,
+                gamma=args.ppo_gamma,
+                lam=args.ppo_lambda,
+                clip=args.ppo_clip,
+                vf_coef=args.ppo_vf_coef,
+                ent_coef=args.ppo_ent_coef,
+                lr=args.ppo_lr,
+                card_dim=args.nn_card_dim,
+                hidden_dim=args.nn_hidden_dim,
+                matmul_precision=args.jax_matmul_precision,
+                mixed_precision=args.nn_mixed_precision,
+                diagnostic="backward_heads_only",
+                compact_card_vocab=args.ppo_jax_compact_cards,
+            ),
+        ),
+        (
+            "diagnostic_jax_ppo_backward_custom_embedding",
+            lambda: bench_native_ppo_jax(
+                deck0,
+                deck1,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                rollout_steps=args.ppo_rollout_steps,
+                minibatch_size=args.ppo_minibatch_size,
+                epochs=args.ppo_epochs,
+                gamma=args.ppo_gamma,
+                lam=args.ppo_lambda,
+                clip=args.ppo_clip,
+                vf_coef=args.ppo_vf_coef,
+                ent_coef=args.ppo_ent_coef,
+                lr=args.ppo_lr,
+                card_dim=args.nn_card_dim,
+                hidden_dim=args.nn_hidden_dim,
+                matmul_precision=args.jax_matmul_precision,
+                mixed_precision=args.nn_mixed_precision,
+                diagnostic="backward_no_adam",
+                custom_embedding_backward=True,
+                compact_card_vocab=args.ppo_jax_compact_cards,
             ),
         ),
         (
@@ -1856,6 +2047,7 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 matmul_precision=args.jax_matmul_precision,
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="adam_only",
+                compact_card_vocab=args.ppo_jax_compact_cards,
             ),
         ),
     ]:
@@ -1883,6 +2075,7 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 matmul_precision=args.jax_matmul_precision,
                 mixed_precision=args.nn_mixed_precision,
                 full_scan_update=True,
+                compact_card_vocab=args.ppo_jax_compact_cards,
             ),
         )
 
@@ -1985,6 +2178,14 @@ def main(argv: list[str] | None = None) -> int:
                         choices=["epochscan", "stepjit", "fullscan"],
                         default="epochscan",
                         help="JAX PPO update compilation strategy")
+    parser.add_argument("--jax-custom-embedding-backward",
+                        action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Use experimental custom VJP for JAX embedding gathers")
+    parser.add_argument("--ppo-jax-compact-cards",
+                        action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Use a deck-local compact card vocabulary for JAX PPO")
     parser.add_argument("--ppo-rollout-steps", type=int, default=128,
                         help="Vectorized PPO rollout length T")
     parser.add_argument("--ppo-minibatch-size", type=int, default=8192,

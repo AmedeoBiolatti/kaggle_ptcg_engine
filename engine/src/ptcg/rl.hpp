@@ -160,6 +160,11 @@ class VectorEnv {
   void reset_all();
   void observe(float* obs, uint8_t* mask, int32_t* player,
                int32_t* result) const;
+  void observe_ids(int32_t* in_play, int32_t* zones, int32_t* player_counts,
+                   int32_t* player_status, int32_t* global,
+                   int32_t* action_meta, int32_t* action_options,
+                   int32_t* action_deck, uint8_t* action_mask,
+                   int32_t* player, int32_t* result) const;
   void step(const int* actions, float* obs, float* reward, uint8_t* done,
             uint8_t* mask, int32_t* player, int32_t* result);
   const GameState& state_at(int i) const { return games_[i]; }
@@ -184,6 +189,11 @@ class PpoBatchEnv {
 
   void reset_all();
   void observe(float* obs, uint8_t* mask, int32_t* player) const;
+  void observe_ids(int32_t* in_play, int32_t* zones, int32_t* player_counts,
+                   int32_t* player_status, int32_t* global,
+                   int32_t* action_meta, int32_t* action_options,
+                   int32_t* action_deck, uint8_t* action_mask,
+                   int32_t* player, int32_t* result) const;
   void action_features(float* out) const;
   void card_features(float* out) const;
   void deck_features(float* out) const;
@@ -199,6 +209,13 @@ class PpoBatchEnv {
   void step(const int* actions, float* obs, float* reward, uint8_t* done,
             uint8_t* mask, int32_t* player, int32_t* result,
             int32_t* episode_len);
+  void step_ids(const int* actions, float* reward, uint8_t* done,
+                int32_t* result, int32_t* episode_len, int32_t* in_play,
+                int32_t* zones, int32_t* player_counts,
+                int32_t* player_status, int32_t* global,
+                int32_t* action_meta, int32_t* action_options,
+                int32_t* action_deck, uint8_t* action_mask,
+                int32_t* player);
 
  private:
   void reset(int i);

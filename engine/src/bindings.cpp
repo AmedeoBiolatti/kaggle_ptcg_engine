@@ -17,6 +17,7 @@
 
 #include "ptcg/card_db.hpp"
 #include "ptcg/effect_vm.hpp"
+#include "ptcg/id_tensors.hpp"
 #include "ptcg/rl.hpp"
 #include "ptcg/state.hpp"
 #include "ptcg/version.hpp"
@@ -41,204 +42,11 @@ static int atom_int(const Descriptor& d, size_t i, int fallback = 0);
 static bool descriptor_equal(const Descriptor& a, const Descriptor& b);
 static py::dict search_transients_to_py(const GameState& st);
 
+static ActionIdView action_id_view_from_options(const RlOptionSet& opts) {
+  return ActionIdView{opts.pending, opts.n, &opts.descriptors};
+}
+
 static constexpr int STATE_CARD_SLOTS = 64;
-static constexpr int STATE_INPLAY_SLOTS = 6;  // active + 5 bench
-static constexpr int STATE_INPLAY_WIDTH = 64;
-static constexpr int STATE_ZONE_COUNT = 4;  // hand, deck, discard, prizes
-static constexpr int STATE_ZONE_SLOTS = 64;
-static constexpr int STATE_PRIZE_SLOTS = 6;
-static constexpr int STATE_MAX_ATTACHED_ENERGY = 16;
-static constexpr int STATE_MAX_TOOLS = 4;
-static constexpr int STATE_MAX_PRE_EVOS = 4;
-static constexpr int STATE_GLOBAL_WIDTH = 32;
-static constexpr int ACTION_META_WIDTH = 16;
-static constexpr int ACTION_OPTION_WIDTH = 24;
-static constexpr int STATE_SELECT_META_WIDTH = ACTION_META_WIDTH;
-static constexpr int STATE_SELECT_OPTION_WIDTH = ACTION_OPTION_WIDTH;
-
-static const InPlay* state_inplay_at_slot(const Player& p, int slot) {
-  if (slot == 0) return p.activePresent ? &p.active : nullptr;
-  int bench_idx = slot - 1;
-  return bench_idx >= 0 && bench_idx < static_cast<int>(p.bench.size())
-             ? &p.bench[bench_idx]
-             : nullptr;
-}
-
-static void fill_packed_state_ids(const GameState& st, int32_t* ip,
-                                  int32_t* zn, int32_t* ct, int32_t* stt,
-                                  int32_t* gl) {
-  const int me = st.yourIndex;
-
-  std::fill(ip, ip + 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH, 0);
-  std::fill(zn, zn + 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS, 0);
-  std::fill(ct, ct + 2 * 5, 0);
-  std::fill(stt, stt + 2 * 5, 0);
-  std::fill(gl, gl + STATE_GLOBAL_WIDTH, 0);
-
-  auto inplay_row = [&](int pov, int slot) {
-    return ip + (pov * STATE_INPLAY_SLOTS + slot) * STATE_INPLAY_WIDTH;
-  };
-  auto zone_row = [&](int pov, int zone) {
-    return zn + (pov * STATE_ZONE_COUNT + zone) * STATE_ZONE_SLOTS;
-  };
-  auto encode_card_value = [](bool present, bool known, int cid) {
-    return !present ? 0 : (known ? cid : -1);
-  };
-
-  for (int pov = 0; pov < 2; ++pov) {
-    const Player& p = st.players[pov == 0 ? me : 1 - me];
-    for (int slot = 0; slot < STATE_INPLAY_SLOTS; ++slot) {
-      const InPlay* pk = state_inplay_at_slot(p, slot);
-      int32_t* row = inplay_row(pov, slot);
-      row[3] = slot == 0 ? AREA_ACTIVE : AREA_BENCH;
-      row[4] = slot == 0 ? 0 : slot - 1;
-      if (!pk) continue;
-      bool known = slot != 0 || p.activeKnown;
-      row[0] = 1;                         // present
-      row[1] = known ? 1 : 0;             // known
-      row[2] = known ? pk->id : -1;       // card_id
-      if (known) {
-        row[5] = pk->hp;
-        row[6] = pk->maxHp;
-      }
-      int flags = 0;
-      flags |= pk->appearThisTurn ? (1 << 0) : 0;
-      flags |= pk->abilityUsedThisTurn ? (1 << 1) : 0;
-      flags |= pk->movedToActiveThisTurn ? (1 << 2) : 0;
-      flags |= pk->healedThisTurn ? (1 << 3) : 0;
-      flags |= pk->noEvolveTurn == st.turn ? (1 << 4) : 0;
-      flags |= pk->noRetreatTurn == st.turn ? (1 << 5) : 0;
-      flags |= pk->noAttackTurn == st.turn ? (1 << 6) : 0;
-      flags |= (pk->abilityUsedThisTurn || pk->reconstructedAbilityPrevUsed)
-                   ? (1 << 7)
-                   : 0;
-      row[7] = flags;
-      row[8] = pk->serial;
-      row[9] = static_cast<int>(pk->energies.size());
-      row[10] = static_cast<int>(pk->energyCardIds.size());
-      row[11] = static_cast<int>(pk->tools.size());
-      row[12] = static_cast<int>(pk->preEvo.size());
-      row[13] = pk->lockId;
-      row[14] = pk->activeLockId;
-
-      int e_limit = std::min(
-          STATE_MAX_ATTACHED_ENERGY,
-          std::max(static_cast<int>(pk->energies.size()),
-                   static_cast<int>(pk->energyCardIds.size())));
-      for (int e = 0; e < e_limit; ++e) {
-        row[16 + e] = e < static_cast<int>(pk->energyCardIds.size())
-                          ? pk->energyCardIds[e]
-                          : -1;
-        row[32 + e] =
-            e < static_cast<int>(pk->energies.size()) ? pk->energies[e] : -1;
-      }
-
-      int t_limit =
-          std::min(STATE_MAX_TOOLS, static_cast<int>(pk->tools.size()));
-      for (int t = 0; t < t_limit; ++t) row[48 + t] = pk->tools[t];
-
-      int p_limit =
-          std::min(STATE_MAX_PRE_EVOS, static_cast<int>(pk->preEvo.size()));
-      for (int i = 0; i < p_limit; ++i) row[52 + i] = pk->preEvo[i];
-    }
-  }
-
-  for (int pov = 0; pov < 2; ++pov) {
-    const Player& p = st.players[pov == 0 ? me : 1 - me];
-    int32_t* hand = zone_row(pov, 0);
-    int32_t* deck = zone_row(pov, 1);
-    int32_t* discard = zone_row(pov, 2);
-    int32_t* prizes = zone_row(pov, 3);
-    for (int i = 0; i < STATE_ZONE_SLOTS; ++i) {
-      if (i < p.handCount) {
-        bool known = p.handKnown && i < static_cast<int>(p.hand.size());
-        int cid = known ? p.hand[i] : -1;
-        if (!known && i < static_cast<int>(p.handKnownCards.size())) {
-          known = true;
-          cid = p.handKnownCards[i];
-        }
-        hand[i] = encode_card_value(true, known, cid);
-      }
-
-      if (i < p.deckCount) {
-        int deck_idx = static_cast<int>(p.deck.size()) - 1 - i;
-        bool has_ordered = deck_idx >= 0;
-        bool known = p.deckKnown ||
-                     (deck_idx >= 0 &&
-                      deck_idx < static_cast<int>(p.deckKnownMask.size()) &&
-                      p.deckKnownMask[deck_idx]);
-        int cid = has_ordered ? p.deck[deck_idx] : -1;
-        if ((!has_ordered || !known) &&
-            i < static_cast<int>(p.deckKnownCards.size())) {
-          known = true;
-          cid = p.deckKnownCards[i];
-        }
-        deck[i] = encode_card_value(true, known, cid);
-      }
-
-      if (i < static_cast<int>(p.discard.size())) {
-        discard[i] = p.discard[i];
-      }
-    }
-
-    for (int i = 0; i < STATE_PRIZE_SLOTS; ++i) {
-      if (i >= p.prizeCount) continue;
-      bool face_up = i < static_cast<int>(p.prizeFaceUp.size()) &&
-                     p.prizeFaceUp[i];
-      bool known = p.prizesKnown ||
-                   (i < static_cast<int>(p.prizesKnownMask.size()) &&
-                    p.prizesKnownMask[i]) ||
-                   face_up;
-      int cid = i < static_cast<int>(p.prizes.size()) ? p.prizes[i] : -1;
-      if ((cid <= 0 || !known) &&
-          i < static_cast<int>(p.prizesKnownCards.size())) {
-          known = true;
-          cid = p.prizesKnownCards[i];
-      }
-      prizes[i] = encode_card_value(true, known, cid);
-      if (face_up) prizes[STATE_PRIZE_SLOTS + i] = 1;
-    }
-
-    ct[pov * 5 + 0] = p.handCount;
-    ct[pov * 5 + 1] = p.deckCount;
-    ct[pov * 5 + 2] = p.prizeCount;
-    ct[pov * 5 + 3] = static_cast<int32_t>(p.discard.size());
-    ct[pov * 5 + 4] = static_cast<int32_t>(p.bench.size());
-    stt[pov * 5 + 0] = p.poisoned ? 1 : 0;
-    stt[pov * 5 + 1] = p.burned ? 1 : 0;
-    stt[pov * 5 + 2] = p.asleep ? 1 : 0;
-    stt[pov * 5 + 3] = p.paralyzed ? 1 : 0;
-    stt[pov * 5 + 4] = p.confused ? 1 : 0;
-  }
-
-  gl[0] = st.turn;
-  gl[1] = st.turnActionCount;
-  gl[2] = st.yourIndex;
-  gl[3] = st.firstPlayer;
-  gl[4] = st.result;
-  gl[5] = st.supporterPlayed ? 1 : 0;
-  gl[6] = st.stadiumPlayed ? 1 : 0;
-  gl[7] = st.energyAttached ? 1 : 0;
-  gl[8] = st.retreated ? 1 : 0;
-  gl[9] = st.teamRocketSupporterPlayed ? 1 : 0;
-  gl[10] = st.ancientSupporterPlayed ? 1 : 0;
-  gl[11] = st.stadium.empty() ? 0 : st.stadium[0];
-  gl[12] = st.stadiumOwner == me ? 0 : (st.stadiumOwner == 1 - me ? 1 : -1);
-  gl[13] = st.stadiumAbilityUsed ? 1 : 0;
-  gl[14] = st.has_pending() ? 1 : 0;
-  gl[15] = st.has_pending() ? st.pending.context : -1;
-  gl[16] = st.has_pending() ? st.pending.minCount : 0;
-  gl[17] = st.has_pending() ? st.pending.maxCount : 0;
-  gl[18] = st.has_pending() ? static_cast<int>(st.pending.options.size()) : 0;
-  gl[19] = st.players[me].benchMax;
-  gl[20] = st.players[1 - me].benchMax;
-  gl[21] = st.players[me].handKnown ? 1 : 0;
-  gl[22] = st.players[1 - me].handKnown ? 1 : 0;
-  gl[23] = st.players[me].deckKnown ? 1 : 0;
-  gl[24] = st.players[1 - me].deckKnown ? 1 : 0;
-  gl[25] = st.players[me].prizesKnown ? 1 : 0;
-  gl[26] = st.players[1 - me].prizesKnown ? 1 : 0;
-}
 
 static py::dict rl_state_ids_py(const GameState& st) {
   using Shape = std::vector<py::ssize_t>;
@@ -248,9 +56,9 @@ static py::dict rl_state_ids_py(const GameState& st) {
   py::array_t<int32_t> counts(Shape{2, 5});
   py::array_t<int32_t> status(Shape{2, 5});
   py::array_t<int32_t> global(Shape{STATE_GLOBAL_WIDTH});
-  fill_packed_state_ids(st, in_play.mutable_data(), zones.mutable_data(),
-                        counts.mutable_data(), status.mutable_data(),
-                        global.mutable_data());
+  ptcg::fill_observation_ids(st, in_play.mutable_data(), zones.mutable_data(),
+                              counts.mutable_data(), status.mutable_data(),
+                              global.mutable_data());
   py::dict out;
   out["in_play"] = in_play;
   out["zones"] = zones;
@@ -1761,242 +1569,6 @@ static py::dict cg_select_from_view(const GameState& st, const CgActionView& vie
   return sel;
 }
 
-static int action_kind_code(std::string_view kind) {
-  if (kind == "END") return 1;
-  if (kind == "PLAY") return 2;
-  if (kind == "ATTACH") return 3;
-  if (kind == "EVOLVE") return 4;
-  if (kind == "ABILITY") return 5;
-  if (kind == "ATTACK") return 6;
-  if (kind == "RETREAT") return 7;
-  if (kind == "DISCARD") return 8;
-  if (kind == "SETUP_ACTIVE") return 9;
-  if (kind == "CARD") return 10;
-  if (kind == "ENERGY") return 11;
-  if (kind == "YES") return 12;
-  if (kind == "NO") return 13;
-  if (kind == "COUNT" || kind == "NUMBER") return 14;
-  if (kind == "SKILL") return 15;
-  if (kind == "SPECIAL_CONDITION") return 16;
-  return 17;
-}
-
-static int action_owner_pov(int owner, int me) {
-  if (owner == me) return 0;
-  if (owner == 1 - me) return 1;
-  return -1;
-}
-
-static int action_target_card_id(const GameState& st, int owner,
-                                 std::string_view area, int index) {
-  if (owner < 0 || owner > 1) return 0;
-  const Player& p = st.players[owner];
-  if (area == "ACTIVE") return p.activeKnown ? p.active.id : -1;
-  if (area == "BENCH")
-    return index >= 0 && index < static_cast<int>(p.bench.size())
-               ? p.bench[index].id
-               : 0;
-  if (area == "STADIUM") return st.stadium.empty() ? 0 : st.stadium[0];
-  if (area == "PRIZE")
-    return index >= 0 && index < static_cast<int>(p.prizes.size())
-               ? p.prizes[index]
-               : -1;
-  return 0;
-}
-
-static void encode_packed_action_option(const GameState& st,
-                                        const Descriptor& d,
-                                        CgHandIndexResolver& hand,
-                                        int selectType, int actionIndex,
-                                        int32_t* row) {
-  const int me = st.yourIndex;
-  const std::string_view kind =
-      d.empty() ? std::string_view("END") : atom_string(d, 0);
-  row[0] = 1;  // present
-  row[2] = action_kind_code(kind);
-  row[17] = actionIndex;
-  if (kind == "END") {
-    row[1] = CG_OPTION_END;
-  } else if (kind == "PLAY") {
-    row[1] = CG_OPTION_PLAY;
-    row[4] = hand.index_for(d, atom_int(d, 1));
-    row[8] = atom_int(d, 1);
-  } else if (kind == "SETUP_ACTIVE") {
-    row[1] = CG_OPTION_CARD;
-    row[3] = CG_AREA_HAND;
-    row[4] = hand.index_for(d, atom_int(d, 1));
-    row[5] = 0;
-    row[8] = atom_int(d, 1);
-  } else if (kind == "ATTACH") {
-    std::string_view targetArea = atom_string(d, 2);
-    int targetIndex = atom_int(d, 3);
-    row[1] = CG_OPTION_ATTACH;
-    row[3] = CG_AREA_HAND;
-    row[4] = hand.index_for(d, atom_int(d, 1));
-    row[5] = 0;
-    row[6] = cg_area_code(targetArea);
-    row[7] = cg_area_index(targetArea, targetIndex);
-    row[8] = atom_int(d, 1);
-    row[9] = action_target_card_id(st, me, targetArea, targetIndex);
-  } else if (kind == "EVOLVE") {
-    std::string_view targetArea = atom_string(d, 2);
-    int targetIndex = atom_int(d, 3);
-    row[1] = CG_OPTION_EVOLVE;
-    row[3] = CG_AREA_HAND;
-    row[4] = hand.index_for(d, atom_int(d, 1));
-    row[5] = 0;
-    row[6] = cg_area_code(targetArea);
-    row[7] = cg_area_index(targetArea, targetIndex);
-    row[8] = atom_int(d, 1);
-    row[9] = action_target_card_id(st, me, targetArea, targetIndex);
-  } else if (kind == "ATTACK") {
-    row[1] = CG_OPTION_ATTACK;
-    row[10] = atom_int(d, 1);
-  } else if (kind == "RETREAT") {
-    row[1] = CG_OPTION_RETREAT;
-    row[3] = CG_AREA_ACTIVE;
-    row[4] = 0;
-    row[5] = 0;
-    row[9] = action_target_card_id(st, me, "ACTIVE", 0);
-  } else if (kind == "ABILITY") {
-    std::string_view area = atom_string(d, 1);
-    int index = atom_int(d, 2);
-    row[1] = CG_OPTION_ABILITY;
-    row[3] = cg_area_code(area);
-    row[4] = cg_area_index(area, index);
-    row[5] = 0;
-    row[9] = action_target_card_id(st, me, area, index);
-  } else if (kind == "DISCARD") {
-    std::string_view area = atom_string(d, 1);
-    int index = atom_int(d, 2);
-    row[1] = CG_OPTION_DISCARD;
-    row[3] = cg_area_code(area);
-    row[4] = cg_area_index(area, index);
-    row[5] = 0;
-    row[9] = action_target_card_id(st, me, area, index);
-  } else if (kind == "CARD") {
-    std::string_view area = atom_string(d, 1);
-    int rawIndex = atom_int(d, 2);
-    int cardId = atom_int(d, d.empty() ? 0 : d.size() - 1);
-    int owner = me;
-    int inplayIdx = 0;
-    int toolIdx = 0;
-    if (cg_decode_tool_ref(rawIndex, me, owner, inplayIdx, toolIdx)) {
-      row[1] = CG_OPTION_TOOL_CARD;
-      row[3] = cg_area_code(area);
-      row[4] = cg_area_index(area, inplayIdx);
-      row[5] = action_owner_pov(owner, me);
-      row[8] = cardId;
-      row[9] = action_target_card_id(st, owner, area, inplayIdx);
-      row[15] = toolIdx;
-      row[18] = rawIndex;
-    } else {
-      owner = cg_infer_card_owner(st, me, area, rawIndex, cardId);
-      row[1] = CG_OPTION_CARD;
-      row[3] = cg_area_code(area);
-      row[4] = cg_area_index(area, rawIndex);
-      row[5] = action_owner_pov(owner, me);
-      row[8] = cardId;
-      row[9] = action_target_card_id(st, owner, area, rawIndex);
-      row[18] = rawIndex;
-    }
-  } else if (kind == "ENERGY") {
-    std::string_view area = atom_string(d, 1);
-    int ref = atom_int(d, 2);
-    if (ref >= 200000) ref -= 200000;
-    int inplayIdx = cg_energy_ref_inplay(ref);
-    int energyIdx = cg_energy_ref_index(ref);
-    int cardId = atom_int(d, d.empty() ? 0 : d.size() - 1);
-    int owner = cg_infer_energy_owner(st, me, inplayIdx, energyIdx, cardId);
-    bool attachedCardSelect =
-        selectType == CG_SELECT_ATTACHED_CARD ||
-        selectType == CG_SELECT_CARD_OR_ATTACHED_CARD;
-    row[1] = attachedCardSelect ? CG_OPTION_ENERGY_CARD : CG_OPTION_ENERGY;
-    row[3] = cg_area_code(area);
-    row[4] = cg_area_index(area, inplayIdx);
-    row[5] = action_owner_pov(owner, me);
-    row[8] = cardId;
-    row[9] = action_target_card_id(st, owner, area, inplayIdx);
-    row[13] = energyIdx;
-    if (!attachedCardSelect)
-      row[14] = cg_energy_count(st, owner, inplayIdx, energyIdx);
-    row[18] = ref;
-  } else if (kind == "YES") {
-    row[1] = CG_OPTION_YES;
-  } else if (kind == "NO") {
-    row[1] = CG_OPTION_NO;
-  } else if (kind == "COUNT" || kind == "NUMBER") {
-    row[1] = CG_OPTION_NUMBER;
-    row[11] = atom_int(d, d.empty() ? 0 : d.size() - 1);
-  } else if (kind == "SKILL") {
-    row[1] = CG_OPTION_SKILL;
-    row[8] = atom_int(d, 1);
-    row[12] = atom_int(d, 2);
-  } else if (kind == "SPECIAL_CONDITION") {
-    row[1] = CG_OPTION_SPECIAL_CONDITION;
-    row[16] = atom_int(d, 1);
-  } else {
-    row[1] = CG_OPTION_END;
-  }
-}
-
-static void fill_packed_action_ids(const GameState& st, const CgActionView& view,
-                                   int32_t* meta, int32_t* options,
-                                   int32_t* deck, uint8_t* mask) {
-  const int selectType = cg_select_type_from_view(view);
-  const int n_options =
-      std::min(static_cast<int>(view.descriptors.size()), RL_MAX_ACTIONS);
-  std::fill(meta, meta + ACTION_META_WIDTH, 0);
-  std::fill(options, options + RL_MAX_ACTIONS * ACTION_OPTION_WIDTH, 0);
-  std::fill(deck, deck + STATE_ZONE_SLOTS, 0);
-  if (mask) std::memset(mask, 0, RL_MAX_ACTIONS);
-
-  meta[0] = view.ctx < 0 ? CG_CONTEXT_MAIN : view.ctx;
-  meta[1] = selectType;
-  meta[2] = view.min_count;
-  meta[3] = view.max_count;
-  meta[4] = n_options;
-  meta[5] = 0;  // deck-window length, filled below.
-  meta[6] = 0;  // remainDamageCounter
-  meta[7] = 0;  // remainEnergyCost
-  meta[8] = st.yourIndex;
-
-  CgHandIndexResolver hand(st.players[st.yourIndex]);
-  for (int i = 0; i < n_options; ++i) {
-    encode_packed_action_option(st, view.descriptors[i], hand, selectType, i,
-                                options + i * ACTION_OPTION_WIDTH);
-    if (mask) mask[i] = 1;
-  }
-
-  int max_deck_idx = -1;
-  for (const Descriptor& d : view.descriptors) {
-    if (d.size() >= 4 && atom_string(d, 0) == "CARD" &&
-        atom_string(d, 1) == "DECK") {
-      int idx = atom_int(d, 2);
-      if (idx >= 0 && idx < STATE_ZONE_SLOTS) {
-        deck[idx] = atom_int(d, 3);
-        max_deck_idx = std::max(max_deck_idx, idx);
-      }
-    }
-  }
-  meta[5] = max_deck_idx + 1;
-}
-
-static CgActionView action_view_from_options(const GameState& st,
-                                             const RlOptionSet& opts) {
-  CgActionView view;
-  if (opts.pending) {
-    view.ctx = st.has_pending() ? st.pending.context : -1;
-    view.min_count = st.has_pending() ? st.pending.minCount : 1;
-    view.max_count = st.has_pending() ? st.pending.maxCount : 1;
-    view.descriptors = st.has_pending() ? st.pending.options
-                                        : std::vector<Descriptor>{};
-  } else {
-    view.descriptors = opts.descriptors;
-  }
-  return view;
-}
-
 static py::dict action_ids_dict(py::array_t<int32_t> meta,
                                 py::array_t<int32_t> options,
                                 py::array_t<int32_t> deck,
@@ -2015,9 +1587,10 @@ static py::dict rl_action_ids_py(const GameState& st) {
   py::array_t<int32_t> options(Shape{RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
   py::array_t<int32_t> deck(Shape{STATE_ZONE_SLOTS});
   py::array_t<uint8_t> mask(Shape{RL_MAX_ACTIONS});
-  fill_packed_action_ids(st, cg_action_view(st), meta.mutable_data(),
-                         options.mutable_data(), deck.mutable_data(),
-                         mask.mutable_data());
+  RlOptionSet opts = rl_options(st);
+  ptcg::fill_action_ids(st, action_id_view_from_options(opts),
+                        meta.mutable_data(), options.mutable_data(),
+                        deck.mutable_data(), mask.mutable_data());
   return action_ids_dict(meta, options, deck, mask);
 }
 
@@ -2029,9 +1602,11 @@ static py::dict rl_state_ids_complete_py(const GameState& st) {
   py::array_t<int32_t> select_options(
       Shape{RL_MAX_ACTIONS, STATE_SELECT_OPTION_WIDTH});
   py::array_t<int32_t> select_deck(Shape{STATE_ZONE_SLOTS});
-  fill_packed_action_ids(st, cg_action_view(st), select_meta.mutable_data(),
-                         select_options.mutable_data(),
-                         select_deck.mutable_data(), nullptr);
+  RlOptionSet opts = rl_options(st);
+  ptcg::fill_action_ids(st, action_id_view_from_options(opts),
+                        select_meta.mutable_data(),
+                        select_options.mutable_data(),
+                        select_deck.mutable_data(), nullptr);
 
   out["select_meta"] = select_meta;
   out["select_options"] = select_options;
@@ -5824,6 +5399,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
         "in_play[2,6,64], zones[2,4,64], player_counts[2,5], "
         "player_status[2,5], global[32], select_meta[16], "
         "select_options[64,16], select_deck[64].");
+  m.def("observation_ids", &rl_state_ids_complete_py, py::arg("state"),
+        "Symbolic mover-POV observation ID tensors.");
   m.def("rl_heuristic_value", &rl_heuristic_value, py::arg("state"),
         "Fast mover-POV prize/active-HP heuristic used by native value MCTS.");
   m.def("rl_native_940_action", &rl_native_940_action, py::arg("state"),
@@ -5926,6 +5503,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
   m.def("rl_action_ids", &rl_action_ids_py, py::arg("state"),
         "Packed symbolic legal-action tensors for embedding models and cg-select "
         "reconstruction. Returns meta[16], options[64,24], deck[64], mask[64].");
+  m.def("action_ids", &rl_action_ids_py, py::arg("state"),
+        "Symbolic legal-action ID tensors.");
   m.def("rl_card_features",
         [](const GameState& st) {
           py::array_t<float> feat(Shape{PPO_CARD_SLOTS, PPO_CARD_FEAT_DIM});
@@ -6063,7 +5642,7 @@ PYBIND11_MODULE(ptcg_engine, m) {
 
              for (int i = 0; i < n; ++i) {
                const GameState& st = e.state_at(i);
-               fill_packed_state_ids(
+               ptcg::fill_observation_ids(
                    st,
                    in_play.mutable_data() +
                        i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
@@ -6072,9 +5651,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
                    counts.mutable_data() + i * 2 * 5,
                    status.mutable_data() + i * 2 * 5,
                    global.mutable_data() + i * STATE_GLOBAL_WIDTH);
-               CgActionView view = action_view_from_options(st, e.options_at(i));
-               fill_packed_action_ids(
-                   st, view,
+               ptcg::fill_action_ids(
+                   st, action_id_view_from_options(e.options_at(i)),
                    select_meta.mutable_data() + i * STATE_SELECT_META_WIDTH,
                    select_options.mutable_data() +
                        i * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
@@ -6137,7 +5715,7 @@ PYBIND11_MODULE(ptcg_engine, m) {
              py::gil_scoped_release rel;
              for (int i = 0; i < n; ++i) {
                const GameState& st = e.state_at(i);
-               fill_packed_state_ids(
+               ptcg::fill_observation_ids(
                    st,
                    in_play.mutable_data() +
                        i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
@@ -6146,9 +5724,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
                    counts.mutable_data() + i * 2 * 5,
                    status.mutable_data() + i * 2 * 5,
                    global.mutable_data() + i * STATE_GLOBAL_WIDTH);
-               CgActionView view = action_view_from_options(st, e.options_at(i));
-               fill_packed_action_ids(
-                   st, view,
+               ptcg::fill_action_ids(
+                   st, action_id_view_from_options(e.options_at(i)),
                    select_meta.mutable_data() + i * STATE_SELECT_META_WIDTH,
                    select_options.mutable_data() +
                        i * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
@@ -6171,9 +5748,9 @@ PYBIND11_MODULE(ptcg_engine, m) {
              auto* mask_p = mask.mutable_data();
              for (int i = 0; i < n; ++i) {
                const GameState& st = e.state_at(i);
-               CgActionView view = action_view_from_options(st, e.options_at(i));
-               fill_packed_action_ids(
-                   st, view, meta_p + i * ACTION_META_WIDTH,
+               ptcg::fill_action_ids(
+                   st, action_id_view_from_options(e.options_at(i)),
+                   meta_p + i * ACTION_META_WIDTH,
                    opt_p + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
                    deck_p + i * STATE_ZONE_SLOTS, mask_p + i * RL_MAX_ACTIONS);
              }
@@ -6206,9 +5783,9 @@ PYBIND11_MODULE(ptcg_engine, m) {
              py::gil_scoped_release rel;
              for (int i = 0; i < n; ++i) {
                const GameState& st = e.state_at(i);
-               CgActionView view = action_view_from_options(st, e.options_at(i));
-               fill_packed_action_ids(
-                   st, view, meta.mutable_data() + i * ACTION_META_WIDTH,
+               ptcg::fill_action_ids(
+                   st, action_id_view_from_options(e.options_at(i)),
+                   meta.mutable_data() + i * ACTION_META_WIDTH,
                    options.mutable_data() +
                        i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
                    deck.mutable_data() + i * STATE_ZONE_SLOTS,
@@ -6266,33 +5843,21 @@ PYBIND11_MODULE(ptcg_engine, m) {
              require_size(result, n, "result");
 
              py::gil_scoped_release rel;
-             for (int i = 0; i < n; ++i) {
-               const GameState& st = e.state_at(i);
-               player.mutable_data()[i] = st.yourIndex;
-               result.mutable_data()[i] = st.result;
-               fill_packed_state_ids(
-                   st,
-                   in_play.mutable_data() +
-                       i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
-                   zones.mutable_data() +
-                       i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
-                   counts.mutable_data() + i * 2 * 5,
-                   status.mutable_data() + i * 2 * 5,
-                   global.mutable_data() + i * STATE_GLOBAL_WIDTH);
-               CgActionView view = action_view_from_options(st, e.options_at(i));
-               fill_packed_action_ids(
-                   st, view,
-                   select_meta.mutable_data() + i * STATE_SELECT_META_WIDTH,
-                   select_options.mutable_data() +
-                       i * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
-                   select_deck.mutable_data() + i * STATE_ZONE_SLOTS, nullptr);
-               fill_packed_action_ids(
-                   st, view, meta.mutable_data() + i * ACTION_META_WIDTH,
-                   options.mutable_data() +
-                       i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
-                   deck.mutable_data() + i * STATE_ZONE_SLOTS,
-                   mask.mutable_data() + i * RL_MAX_ACTIONS);
-             }
+             e.observe_ids(in_play.mutable_data(), zones.mutable_data(),
+                           counts.mutable_data(), status.mutable_data(),
+                           global.mutable_data(), meta.mutable_data(),
+                           options.mutable_data(), deck.mutable_data(),
+                           mask.mutable_data(), player.mutable_data(),
+                           result.mutable_data());
+             std::memcpy(select_meta.mutable_data(), meta.mutable_data(),
+                         static_cast<size_t>(n) * STATE_SELECT_META_WIDTH *
+                             sizeof(int32_t));
+             std::memcpy(select_options.mutable_data(), options.mutable_data(),
+                         static_cast<size_t>(n) * RL_MAX_ACTIONS *
+                             STATE_SELECT_OPTION_WIDTH * sizeof(int32_t));
+             std::memcpy(select_deck.mutable_data(), deck.mutable_data(),
+                         static_cast<size_t>(n) * STATE_ZONE_SLOTS *
+                             sizeof(int32_t));
            },
            py::arg("state_out"), py::arg("action_out"), py::arg("player"),
            py::arg("result"),

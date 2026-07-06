@@ -15,9 +15,21 @@
 #include <utility>
 
 #include "ptcg/card_db.hpp"
+#include "ptcg/id_tensors.hpp"
 #include "ptcg/types.hpp"
 
 namespace ptcg {
+
+namespace {
+
+static_assert(ACTION_MAX_OPTIONS == RL_MAX_ACTIONS,
+              "action ID tensor width must match action mask width");
+
+ActionIdView action_id_view_from_options(const RlOptionSet& opts) {
+  return ActionIdView{opts.pending, opts.n, &opts.descriptors};
+}
+
+}  // namespace
 
 // --- local RNG (xorshift64, matching the engine's) ------------------------
 static inline uint64_t rl_rand(uint64_t& s) {
@@ -1405,6 +1417,31 @@ void VectorEnv::observe(float* obs, uint8_t* mask, int32_t* player,
   });
 }
 
+void VectorEnv::observe_ids(int32_t* in_play, int32_t* zones,
+                            int32_t* player_counts, int32_t* player_status,
+                            int32_t* global, int32_t* action_meta,
+                            int32_t* action_options, int32_t* action_deck,
+                            uint8_t* action_mask, int32_t* player,
+                            int32_t* result) const {
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    const GameState& st = games_[i];
+    fill_observation_ids(
+        st,
+        in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    fill_action_ids(
+        st, action_id_view_from_options(opts_[i]),
+        action_meta + i * ACTION_META_WIDTH,
+        action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+        action_deck + i * STATE_ZONE_SLOTS,
+        action_mask + i * RL_MAX_ACTIONS);
+    player[i] = st.yourIndex;
+    result[i] = st.result;
+  });
+}
+
 void VectorEnv::step(const int* actions, float* obs, float* reward,
                      uint8_t* done, uint8_t* mask, int32_t* player,
                      int32_t* result) {
@@ -2200,6 +2237,31 @@ void PpoBatchEnv::observe(float* obs, uint8_t* mask, int32_t* player) const {
   });
 }
 
+void PpoBatchEnv::observe_ids(int32_t* in_play, int32_t* zones,
+                              int32_t* player_counts, int32_t* player_status,
+                              int32_t* global, int32_t* action_meta,
+                              int32_t* action_options, int32_t* action_deck,
+                              uint8_t* action_mask, int32_t* player,
+                              int32_t* result) const {
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    const GameState& st = games_[i];
+    fill_observation_ids(
+        st,
+        in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    fill_action_ids(
+        st, action_id_view_from_options(opts_[i]),
+        action_meta + i * ACTION_META_WIDTH,
+        action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+        action_deck + i * STATE_ZONE_SLOTS,
+        action_mask + i * RL_MAX_ACTIONS);
+    player[i] = st.yourIndex;
+    result[i] = st.result;
+  });
+}
+
 void PpoBatchEnv::action_features(float* out) const {
   EnvPool::instance().run(size(), threads_, [&](int i) {
     encode_action_features_from_options(
@@ -2279,6 +2341,32 @@ void PpoBatchEnv::step(const int* actions, float* obs, float* reward,
     rl_encode_obs(games_[i], obs + i * D);
     fill_legal_mask(opts_[i], mask + i * RL_MAX_ACTIONS);
     player[i] = games_[i].yourIndex;
+  });
+}
+
+void PpoBatchEnv::step_ids(const int* actions, float* reward, uint8_t* done,
+                           int32_t* result, int32_t* episode_len,
+                           int32_t* in_play, int32_t* zones,
+                           int32_t* player_counts, int32_t* player_status,
+                           int32_t* global, int32_t* action_meta,
+                           int32_t* action_options, int32_t* action_deck,
+                           uint8_t* action_mask, int32_t* player) {
+  step_rewards(actions, reward, done, result, episode_len);
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    const GameState& st = games_[i];
+    fill_observation_ids(
+        st,
+        in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    fill_action_ids(
+        st, action_id_view_from_options(opts_[i]),
+        action_meta + i * ACTION_META_WIDTH,
+        action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+        action_deck + i * STATE_ZONE_SLOTS,
+        action_mask + i * RL_MAX_ACTIONS);
+    player[i] = st.yourIndex;
   });
 }
 
