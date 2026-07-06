@@ -1187,6 +1187,12 @@ static bool matches_dynamic_inplay_filter(const GameState& st, const EffectFrame
            !p.appearThisTurn &&
            hand_has_stage2_for_basic(st.players[fr.a], p.id);
   }
+  // An in-play Antique Fossil plays AS a 60-HP Basic {C} Pokemon, so it matches
+  // Pokemon / Basic-Pokemon in-play targets even though its printed card type is
+  // Item. (In hand/deck it is an Item and must NOT match, so this is in-play only.)
+  if (is_antique_fossil(p.id) &&
+      (filter == F_POKEMON || filter == F_BASIC_POKEMON))
+    return true;
   return matches_filter(p.id, filter);
 }
 
@@ -4993,6 +4999,14 @@ static void build_choose(GameState& st, const Op& o) {
     pd.maxCount = discardCount;
     requiredMin = discardCount;
   }
+  if (fr.sourceCardId == 1239 && zone == Z_HAND && pd.context == CTX_DISCARD) {
+    // Naveen: you may discard from hand, but must discard down to keep at most
+    // 4 so the follow-up "draw until 5" draws at least one card (cabt models
+    // this as select-type MaxCardUntil 4: minCount = handCount - 4).
+    int mustDiscard = std::max(0, static_cast<int>(pd.options.size()) - 4);
+    pd.minCount = mustDiscard;
+    requiredMin = mustDiscard;
+  }
   if (fr.attackId == 955 && fr.sourceCardId == 1184)
     pd.minCount = 0;  // Ninetales copying Lana's Aid can choose zero.
   if (!preserves_unclamped_choice_count(fr, o) &&
@@ -6018,11 +6032,12 @@ void run_program(GameState& st, const std::vector<int>& tape) {
         fr.pc += 1;
         if (needsPromote) {
           if (run_pre_promote_immediate_damage_hooks(st, fr.a)) return;
+          int actor = fr.a;
           EffectFrame promote;
           promote.effect = EFF_ABILITY_PROMOTE;
-          promote.a = fr.a;
+          promote.a = actor;
           st.effectStack.push_back(promote);
-          set_promote_pending(st, fr.a);
+          set_promote_pending(st, actor);
           return;
         }
         if (st.result >= 0) {
@@ -6065,11 +6080,12 @@ void run_program(GameState& st, const std::vector<int>& tape) {
         fr.pc += 1;
         if (needsPromote) {
           if (run_pre_promote_immediate_damage_hooks(st, fr.a)) return;
+          int actor = fr.a;
           EffectFrame promote;
           promote.effect = EFF_ABILITY_PROMOTE;
-          promote.a = fr.a;
+          promote.a = actor;
           st.effectStack.push_back(promote);
-          set_promote_pending(st, fr.a);
+          set_promote_pending(st, actor);
           return;
         }
         if (st.result >= 0) {
@@ -6118,11 +6134,12 @@ void run_program(GameState& st, const std::vector<int>& tape) {
         st.lastEffectCount = moved;
         fr.pc += 1;
         if (needsPromote) {
+          int actor = fr.a;
           EffectFrame promote;
           promote.effect = EFF_ABILITY_PROMOTE;
-          promote.a = fr.a;
+          promote.a = actor;
           st.effectStack.push_back(promote);
-          set_promote_pending(st, fr.a);
+          set_promote_pending(st, actor);
           return;
         }
         if (st.result >= 0) {
@@ -9406,6 +9423,7 @@ static bool player_has_tool_or_special_energy_inplay(const Player& p) {
 
 static bool player_has_basic_bench(const Player& p) {
   for (const auto& b : p.bench) {
+    if (is_antique_fossil(b.id)) return true;  // in play it is a Basic {C} Pokemon
     const CardInfo* c = find_card(b.id);
     if (c && c->cardType == POKEMON && c->basic) return true;
   }
@@ -9736,6 +9754,8 @@ static bool card_gate_ok(const GameState& st, int cardId) {
       return opp.prizeCount <= 2;
     case CG_RARE_CANDY:
       return rare_candy_gate_ok(st, me);
+    case CG_OPP_HAND_GT_0:
+      return opp.handCount > 0;
     default:
       return false;
   }

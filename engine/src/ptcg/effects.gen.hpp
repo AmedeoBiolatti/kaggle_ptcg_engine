@@ -6510,12 +6510,16 @@ inline int bench_to_active_observer_watch(int id) {
 
 inline int card_gate(int id) {
   switch (id) {
+    case 1078: return 12;
     case 1079: return 14;
     case 1080: return 1;
     case 1098: return 6;
     case 1101: return 3;
+    case 1103: return 15;
     case 1121: return 8;
+    case 1149: return 15;
     case 1185: return 12;
+    case 1186: return 15;
     case 1187: return 7;
     case 1193: return 1;
     case 1196: return 4;

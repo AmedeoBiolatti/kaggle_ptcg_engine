@@ -269,6 +269,7 @@ enum CardGate {
   CG_OWN_DECK_GT_0,
   CG_OPP_PRIZES_LE_2,
   CG_RARE_CANDY,
+  CG_OPP_HAND_GT_0,
 };
 
 enum PrizeBonusKind { PB_TERA_ATTACKER = 0, PB_N_ATTACKER };

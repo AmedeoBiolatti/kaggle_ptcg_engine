@@ -8,11 +8,6 @@
 namespace ptcg {
 namespace {
 
-constexpr int STATE_PRIZE_SLOTS = 6;
-constexpr int STATE_MAX_ATTACHED_ENERGY = 16;
-constexpr int STATE_MAX_TOOLS = 4;
-constexpr int STATE_MAX_PRE_EVOS = 4;
-
 constexpr int CG_AREA_DECK = 1;
 constexpr int CG_AREA_HAND = 2;
 constexpr int CG_AREA_DISCARD = 3;

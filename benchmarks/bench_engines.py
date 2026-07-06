@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -1020,11 +1021,15 @@ def bench_native_ppo_jax(
     diagnostic: str = "full",
     custom_embedding_backward: bool = False,
     compact_card_vocab: bool = True,
+    optimizer_name: str = "optax",
+    freeze_embeddings: bool = False,
+    entropy_mode: str = "full",
 ) -> tuple[int, int, float, dict[str, Any]]:
     _clear_native_modules()
     _prefer_native_paths()
     import jax
     import jax.numpy as jnp
+    import optax
     import ptcg_engine as E
     from ptcg.jax_nn import forward_policy_value, init_compact_params, init_params
 
@@ -1035,22 +1040,22 @@ def bench_native_ppo_jax(
     state_np = env.state_ids()
     action_np = env.action_ids()
     state_buf = {
-        key: np.empty((rollout_steps, *value.shape), dtype=value.dtype)
+        key: jnp.empty((rollout_steps, *value.shape), dtype=jnp.asarray(value).dtype)
         for key, value in state_np.items()
         if hasattr(value, "shape")
     }
     action_buf = {
-        key: np.empty((rollout_steps, *value.shape), dtype=value.dtype)
+        key: jnp.empty((rollout_steps, *value.shape), dtype=jnp.asarray(value).dtype)
         for key, value in action_np.items()
         if hasattr(value, "shape")
     }
     player = np.empty((batch_size,), dtype=np.int32)
     result = np.empty((batch_size,), dtype=np.int32)
-    rewards = np.empty((rollout_steps, batch_size), dtype=np.float32)
-    dones = np.empty((rollout_steps, batch_size), dtype=np.float32)
-    actions_buf = np.empty((rollout_steps, batch_size), dtype=np.int32)
-    logprobs = np.empty((rollout_steps, batch_size), dtype=np.float32)
-    values = np.empty((rollout_steps, batch_size), dtype=np.float32)
+    rewards = jnp.empty((rollout_steps, batch_size), dtype=jnp.float32)
+    dones = jnp.empty((rollout_steps, batch_size), dtype=jnp.float32)
+    actions_buf = jnp.empty((rollout_steps, batch_size), dtype=jnp.int32)
+    logprobs = jnp.empty((rollout_steps, batch_size), dtype=jnp.float32)
+    values = jnp.empty((rollout_steps, batch_size), dtype=jnp.float32)
 
     if compact_card_vocab:
         params, card_id_remap = init_compact_params(
@@ -1078,7 +1083,40 @@ def bench_native_ppo_jax(
         else jax.default_matmul_precision(matmul_precision)
     )
 
+    frozen_embedding_keys = frozenset((
+        "card_embedding",
+        "role_gate",
+        "attack_embedding",
+        "kind_embedding",
+        "type_embedding",
+        "area_embedding",
+    ))
+    if freeze_embeddings:
+        frozen_params = {
+            key: value
+            for key, value in params.items()
+            if key in frozen_embedding_keys
+        }
+        params = {
+            key: value
+            for key, value in params.items()
+            if key not in frozen_embedding_keys
+        }
+    else:
+        frozen_params = {}
+
+    def join_params(p):
+        if not freeze_embeddings:
+            return p
+        return {**frozen_params, **p}
+
+    tx = None
+    if optimizer_name == "optax":
+        tx = optax.adam(lr, mu_dtype=jnp.float32)
+
     def adam_init(p):
+        if tx is not None:
+            return tx.init(p)
         zeros = jax.tree_util.tree_map(
             lambda value: jnp.zeros(value.shape, dtype=jnp.float32),
             p,
@@ -1086,6 +1124,15 @@ def bench_native_ppo_jax(
         return {"m": zeros, "v": zeros, "t": jnp.array(0, dtype=jnp.int32)}
 
     def adam_update(p, grads, opt_state):
+        if tx is not None:
+            updates, opt_state = tx.update(grads, opt_state, p)
+            p = optax.apply_updates(p, updates)
+            p = jax.tree_util.tree_map(
+                lambda p_, ref: p_.astype(ref.dtype) if jnp.issubdtype(ref.dtype, jnp.floating) else p_,
+                p,
+                params,
+            )
+            return p, opt_state
         t = opt_state["t"] + 1
         b1, b2, eps = 0.9, 0.999, 1e-8
         m = jax.tree_util.tree_map(lambda m_, g: b1 * m_ + (1.0 - b1) * g, opt_state["m"], grads)
@@ -1110,7 +1157,7 @@ def bench_native_ppo_jax(
         mask,
     ):
         return forward_policy_value(
-            p,
+            join_params(p),
             in_play,
             zones,
             player_counts,
@@ -1153,6 +1200,61 @@ def bench_native_ppo_jax(
         logprobs = jnp.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(1)
         return key, actions, logprobs, out["value"].astype(jnp.float32)
 
+    @jax.jit
+    def compute_gae_device(rewards_, dones_, values_, bootstrap_):
+        def step(carry, inputs):
+            next_advantage, next_value = carry
+            reward, done, value = inputs
+            not_done = 1.0 - done
+            delta = reward + gamma * not_done * next_value - value
+            advantage = delta + gamma * lam * not_done * next_advantage
+            return (advantage, value), advantage
+
+        init = (jnp.zeros_like(bootstrap_), bootstrap_)
+        _carry, advantages_ = jax.lax.scan(
+            step,
+            init,
+            (rewards_, dones_, values_),
+            reverse=True,
+        )
+        return advantages_, advantages_ + values_
+
+    @partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4, 5, 6))
+    def store_rollout_step(
+        state_buf_,
+        action_buf_,
+        rewards_,
+        dones_,
+        actions_buf_,
+        logprobs_,
+        values_,
+        t,
+        state_step,
+        action_step,
+        reward_,
+        done_,
+        action_,
+        logprob_,
+        value_,
+    ):
+        state_buf_ = {
+            key: value.at[t].set(state_step[key])
+            for key, value in state_buf_.items()
+        }
+        action_buf_ = {
+            key: value.at[t].set(action_step[key])
+            for key, value in action_buf_.items()
+        }
+        return (
+            state_buf_,
+            action_buf_,
+            rewards_.at[t].set(reward_),
+            dones_.at[t].set(done_),
+            actions_buf_.at[t].set(action_),
+            logprobs_.at[t].set(logprob_),
+            values_.at[t].set(value_),
+        )
+
     def ppo_loss(
         p,
         in_play,
@@ -1180,9 +1282,11 @@ def bench_native_ppo_jax(
         logits = out["logits"].astype(jnp.float32)
         value = out["value"].astype(jnp.float32)
         logp_all = jax.nn.log_softmax(logits, axis=-1)
-        probs = jax.nn.softmax(logits, axis=-1)
         new_logp = jnp.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(1)
-        entropy = -jnp.sum(probs * logp_all, axis=-1).mean()
+        if entropy_mode == "off" or ent_coef == 0.0:
+            entropy = jnp.array(0.0, dtype=jnp.float32)
+        else:
+            entropy = -jnp.sum(jnp.exp(logp_all) * logp_all, axis=-1).mean()
         ratio = jnp.exp(new_logp - old_logprobs)
         policy_loss = -jnp.minimum(
             ratio * advantages_,
@@ -1193,20 +1297,8 @@ def bench_native_ppo_jax(
         metrics = jnp.array([policy_loss, value_loss, entropy, total_loss], dtype=jnp.float32)
         return total_loss, metrics
 
-    frozen_embedding_keys = frozenset((
-        "card_embedding",
-        "role_gate",
-        "attack_embedding",
-        "kind_embedding",
-        "type_embedding",
-        "area_embedding",
-    ))
-
     def freeze_embedding_params(p):
-        return {
-            key: jax.lax.stop_gradient(value) if key in frozen_embedding_keys else value
-            for key, value in p.items()
-        }
+        return p
 
     @jax.jit
     def ppo_step(
@@ -1359,27 +1451,27 @@ def bench_native_ppo_jax(
         return params, opt_state, metrics
 
     @jax.jit
-    def ppo_epoch_update(params, opt_state, epoch_batch):
+    def ppo_epoch_index_update(params, opt_state, batch, epoch_indices):
         def step(carry, mb):
             p, opt = carry
             (loss, metrics), grads = jax.value_and_grad(ppo_loss, has_aux=True)(
                 p,
-                mb["in_play"],
-                mb["zones"],
-                mb["player_counts"],
-                mb["player_status"],
-                mb["global"],
-                mb["options"],
-                mb["mask"],
-                mb["actions"],
-                mb["old_logprobs"],
-                mb["advantages"],
-                mb["returns"],
+                batch["in_play"][mb],
+                batch["zones"][mb],
+                batch["player_counts"][mb],
+                batch["player_status"][mb],
+                batch["global"][mb],
+                batch["options"][mb],
+                batch["mask"][mb],
+                batch["actions"][mb],
+                batch["old_logprobs"][mb],
+                batch["advantages"][mb],
+                batch["returns"][mb],
             )
             p, opt = adam_update(p, grads, opt)
             return (p, opt), metrics
 
-        (params, opt_state), metrics = jax.lax.scan(step, (params, opt_state), epoch_batch)
+        (params, opt_state), metrics = jax.lax.scan(step, (params, opt_state), epoch_indices)
         return params, opt_state, metrics[-1]
 
     @jax.jit
@@ -1412,81 +1504,126 @@ def bench_native_ppo_jax(
     rollout_key = jax.random.PRNGKey(seed + 17)
     with precision_ctx:
         env.observe_ids_into(state_np, action_np, player, result)
+        state_jax = {key: jnp.asarray(state_np[key]) for key in state_buf}
+        action_jax = {key: jnp.asarray(action_np[key]) for key in action_buf}
         rollout_key, warm_actions, warm_logprobs, warm_values = sample_policy(
             params,
             rollout_key,
-            jnp.asarray(state_np["in_play"]),
-            jnp.asarray(state_np["zones"]),
-            jnp.asarray(state_np["player_counts"]),
-            jnp.asarray(state_np["player_status"]),
-            jnp.asarray(state_np["global"]),
-            jnp.asarray(action_np["options"]),
-            jnp.asarray(action_np["mask"]),
+            state_jax["in_play"],
+            state_jax["zones"],
+            state_jax["player_counts"],
+            state_jax["player_status"],
+            state_jax["global"],
+            action_jax["options"],
+            action_jax["mask"],
         )
-        jax.block_until_ready((rollout_key, warm_actions, warm_logprobs, warm_values))
+        (
+            state_buf,
+            action_buf,
+            rewards,
+            dones,
+            actions_buf,
+            logprobs,
+            values,
+        ) = store_rollout_step(
+            state_buf,
+            action_buf,
+            rewards,
+            dones,
+            actions_buf,
+            logprobs,
+            values,
+            jnp.array(0, dtype=jnp.int32),
+            state_jax,
+            action_jax,
+            jnp.zeros((batch_size,), dtype=jnp.float32),
+            jnp.zeros((batch_size,), dtype=jnp.float32),
+            warm_actions,
+            warm_logprobs,
+            warm_values,
+        )
+        gae_warm = compute_gae_device(
+            jnp.zeros_like(rewards),
+            jnp.zeros_like(dones),
+            jnp.zeros_like(values),
+            warm_values,
+        )
+        jax.block_until_ready((rollout_key, warm_actions, warm_logprobs, warm_values, state_buf, action_buf, rewards, dones, actions_buf, logprobs, values, gae_warm))
 
         rollout_start = time.perf_counter()
         for t in range(rollout_steps):
             env.observe_ids_into(state_np, action_np, player, result)
-            for key in state_buf:
-                state_buf[key][t] = state_np[key]
-            for key in action_buf:
-                action_buf[key][t] = action_np[key]
+            state_jax = {key: jnp.asarray(state_np[key]) for key in state_buf}
+            action_jax = {key: jnp.asarray(action_np[key]) for key in action_buf}
             rollout_key, action_t, logprob_t, value_t = sample_policy(
                 params,
                 rollout_key,
-                jnp.asarray(state_np["in_play"]),
-                jnp.asarray(state_np["zones"]),
-                jnp.asarray(state_np["player_counts"]),
-                jnp.asarray(state_np["player_status"]),
-                jnp.asarray(state_np["global"]),
-                jnp.asarray(action_np["options"]),
-                jnp.asarray(action_np["mask"]),
+                state_jax["in_play"],
+                state_jax["zones"],
+                state_jax["player_counts"],
+                state_jax["player_status"],
+                state_jax["global"],
+                action_jax["options"],
+                action_jax["mask"],
             )
-            actions, logprob_np, value_np = jax.device_get((action_t, logprob_t, value_t))
-            actions = np.asarray(actions, dtype=np.int32)
+            actions = np.asarray(jax.device_get(action_t), dtype=np.int32)
             _obs, reward, done, _mask, _player, _result = env.step(actions)
-            rewards[t] = np.asarray(reward, dtype=np.float32)
-            dones[t] = np.asarray(done, dtype=np.float32)
-            actions_buf[t] = actions
-            logprobs[t] = np.asarray(logprob_np, dtype=np.float32)
-            values[t] = np.asarray(value_np, dtype=np.float32)
-        jax.block_until_ready(rollout_key)
+            (
+                state_buf,
+                action_buf,
+                rewards,
+                dones,
+                actions_buf,
+                logprobs,
+                values,
+            ) = store_rollout_step(
+                state_buf,
+                action_buf,
+                rewards,
+                dones,
+                actions_buf,
+                logprobs,
+                values,
+                jnp.asarray(t, dtype=jnp.int32),
+                state_jax,
+                action_jax,
+                jnp.asarray(reward, dtype=jnp.float32),
+                jnp.asarray(done, dtype=jnp.float32),
+                action_t,
+                logprob_t,
+                value_t,
+            )
+        jax.block_until_ready((rollout_key, rewards, dones, actions_buf, logprobs, values))
         rollout_seconds = time.perf_counter() - rollout_start
 
         env.observe_ids_into(state_np, action_np, player, result)
+        state_jax = {key: jnp.asarray(state_np[key]) for key in state_buf}
+        action_jax = {key: jnp.asarray(action_np[key]) for key in action_buf}
         bootstrap = infer(
             params,
-            jnp.asarray(state_np["in_play"]),
-            jnp.asarray(state_np["zones"]),
-            jnp.asarray(state_np["player_counts"]),
-            jnp.asarray(state_np["player_status"]),
-            jnp.asarray(state_np["global"]),
-            jnp.asarray(action_np["options"]),
-            jnp.asarray(action_np["mask"]),
+            state_jax["in_play"],
+            state_jax["zones"],
+            state_jax["player_counts"],
+            state_jax["player_status"],
+            state_jax["global"],
+            action_jax["options"],
+            action_jax["mask"],
         )["value"]
-        advantages, returns = _compute_gae(
-            rewards,
-            dones,
-            values,
-            np.asarray(jax.device_get(bootstrap), dtype=np.float32),
-            gamma=gamma,
-            lam=lam,
-        )
+        advantages, returns = compute_gae_device(rewards, dones, values, bootstrap.astype(jnp.float32))
         total = rollout_steps * batch_size
         indices = _ppo_indices(total, minibatch_size, epochs, seed + 1009)
         batch = {
-            "in_play": jnp.asarray(state_buf["in_play"].reshape((total, *state_buf["in_play"].shape[2:]))),
-            "zones": jnp.asarray(state_buf["zones"].reshape((total, *state_buf["zones"].shape[2:]))),
-            "player_counts": jnp.asarray(state_buf["player_counts"].reshape((total, *state_buf["player_counts"].shape[2:]))),
-            "player_status": jnp.asarray(state_buf["player_status"].reshape((total, *state_buf["player_status"].shape[2:]))),
-            "global": jnp.asarray(state_buf["global"].reshape((total, *state_buf["global"].shape[2:]))),
-            "options": jnp.asarray(action_buf["options"].reshape((total, *action_buf["options"].shape[2:]))),
-            "mask": jnp.asarray(action_buf["mask"].reshape((total, *action_buf["mask"].shape[2:]))),
-            "actions": jnp.asarray(actions_buf.reshape(total), dtype=jnp.int32),
-            "old_logprobs": jnp.asarray(logprobs.reshape(total), dtype=jnp.float32),
-            "advantages": jnp.asarray(advantages.reshape(total), dtype=jnp.float32),
-            "returns": jnp.asarray(returns.reshape(total), dtype=jnp.float32),
+            "in_play": state_buf["in_play"].reshape((total, *state_buf["in_play"].shape[2:])),
+            "zones": state_buf["zones"].reshape((total, *state_buf["zones"].shape[2:])),
+            "player_counts": state_buf["player_counts"].reshape((total, *state_buf["player_counts"].shape[2:])),
+            "player_status": state_buf["player_status"].reshape((total, *state_buf["player_status"].shape[2:])),
+            "global": state_buf["global"].reshape((total, *state_buf["global"].shape[2:])),
+            "options": action_buf["options"].reshape((total, *action_buf["options"].shape[2:])),
+            "mask": action_buf["mask"].reshape((total, *action_buf["mask"].shape[2:])),
+            "actions": actions_buf.reshape(total).astype(jnp.int32),
+            "old_logprobs": logprobs.reshape(total).astype(jnp.float32),
+            "advantages": advantages.reshape(total).astype(jnp.float32),
+            "returns": returns.reshape(total).astype(jnp.float32),
         }
         opt_state = adam_init(params)
         update_start = time.perf_counter()
@@ -1564,17 +1701,15 @@ def bench_native_ppo_jax(
             minibatches_per_epoch = usable // minibatch_size
             last = jnp.zeros((4,), dtype=jnp.float32)
             for epoch in range(epochs):
-                epoch_perm = indices[
+                epoch_indices = indices[
                     epoch * minibatches_per_epoch:(epoch + 1) * minibatches_per_epoch
-                ].reshape(-1)
-                epoch_perm_jax = jnp.asarray(epoch_perm, dtype=jnp.int32)
-                epoch_batch = {
-                    key: value[epoch_perm_jax].reshape(
-                        (minibatches_per_epoch, minibatch_size, *value.shape[1:])
-                    )
-                    for key, value in batch.items()
-                }
-                params, opt_state, last = ppo_epoch_update(params, opt_state, epoch_batch)
+                ]
+                params, opt_state, last = ppo_epoch_index_update(
+                    params,
+                    opt_state,
+                    batch,
+                    jnp.asarray(epoch_indices, dtype=jnp.int32),
+                )
             update_mode = "epochscan"
         else:
             last = jnp.zeros((4,), dtype=jnp.float32)
@@ -1613,6 +1748,9 @@ def bench_native_ppo_jax(
         "contiguous_mb": epoch_scan_update and not full_scan_update,
         "custom_emb_bwd": custom_embedding_backward,
         "compact_cards": compact_card_vocab,
+        "optimizer": optimizer_name,
+        "freeze_emb": freeze_embeddings,
+        "entropy_mode": entropy_mode,
         "mixed": mixed_precision if mixed_dtype is not None else "off",
         "policy_loss": float(last_np[0]),
         "value_loss": float(last_np[1]),
@@ -1927,6 +2065,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 epoch_scan_update=args.ppo_jax_update_mode == "epochscan",
                 custom_embedding_backward=args.jax_custom_embedding_backward,
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         ),
         (
@@ -1951,6 +2092,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="forward_only",
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         ),
         (
@@ -1975,6 +2119,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="backward_no_adam",
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         ),
         (
@@ -1999,6 +2146,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="backward_heads_only",
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         ),
         (
@@ -2024,6 +2174,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 diagnostic="backward_no_adam",
                 custom_embedding_backward=True,
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         ),
         (
@@ -2048,6 +2201,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 mixed_precision=args.nn_mixed_precision,
                 diagnostic="adam_only",
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         ),
     ]:
@@ -2076,6 +2232,9 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 mixed_precision=args.nn_mixed_precision,
                 full_scan_update=True,
                 compact_card_vocab=args.ppo_jax_compact_cards,
+                optimizer_name=args.ppo_jax_optimizer,
+                freeze_embeddings=args.ppo_jax_freeze_embeddings,
+                entropy_mode=args.ppo_jax_entropy,
             ),
         )
 
@@ -2186,6 +2345,16 @@ def main(argv: list[str] | None = None) -> int:
                         action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Use a deck-local compact card vocabulary for JAX PPO")
+    parser.add_argument("--ppo-jax-optimizer",
+                        choices=["optax", "manual"], default="optax",
+                        help="Optimizer implementation for JAX PPO")
+    parser.add_argument("--ppo-jax-freeze-embeddings",
+                        action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Freeze JAX PPO embedding tables and role gates during update")
+    parser.add_argument("--ppo-jax-entropy",
+                        choices=["full", "off"], default="full",
+                        help="Entropy calculation mode for JAX PPO updates")
     parser.add_argument("--ppo-rollout-steps", type=int, default=128,
                         help="Vectorized PPO rollout length T")
     parser.add_argument("--ppo-minibatch-size", type=int, default=8192,
