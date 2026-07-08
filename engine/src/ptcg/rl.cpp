@@ -1466,6 +1466,45 @@ void VectorEnv::step(const int* actions, float* obs, float* reward,
   });
 }
 
+void VectorEnv::step_ids(const int* actions, float* reward, uint8_t* done,
+                         int32_t* in_play, int32_t* zones,
+                         int32_t* player_counts, int32_t* player_status,
+                         int32_t* global, int32_t* action_meta,
+                         int32_t* action_options, int32_t* action_deck,
+                         uint8_t* action_mask, int32_t* player,
+                         int32_t* result) {
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    int actor = games_[i].yourIndex;
+    apply_choice_cached(games_[i], opts_[i], actions[i]);
+    advance_to_agent(games_[i], rngs_[i], &opts_[i]);
+    int r = games_[i].result;
+    if (r >= 0) {
+      reward[i] = (r == 2) ? 0.f : (r == actor ? 1.f : -1.f);
+      done[i] = 1;
+      reset(i);
+    } else {
+      reward[i] = 0.f;
+      done[i] = 0;
+    }
+
+    const GameState& st = games_[i];
+    fill_observation_ids(
+        st,
+        in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    fill_action_ids(
+        st, action_id_view_from_options(opts_[i]),
+        action_meta + i * ACTION_META_WIDTH,
+        action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+        action_deck + i * STATE_ZONE_SLOTS,
+        action_mask + i * RL_MAX_ACTIONS);
+    player[i] = st.yourIndex;
+    result[i] = st.result;
+  });
+}
+
 namespace {
 
 constexpr int C_MAKUHITA = 673;

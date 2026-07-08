@@ -472,7 +472,8 @@ def _state_for_native(current: dict[str, Any], hidden: dict[int, PlayerHidden],
                     "lastAncientAttackSerial",
                     "prizeTakenTurn", "prizeTakenCount",
                     "noItemTurn", "noSupporterTurn", "noEvolveTurn",
-                    "noStadiumTurn", "teamReduceTurn", "teamReduceAmount",
+                    "noStadiumTurn", "discardHandEndTurn",
+                    "discardHandEndThreshold", "teamReduceTurn", "teamReduceAmount",
                     "teamReduceType", "activeExDamageBuffTurn",
                     "activeExDamageBuffAmount", "prizeBonusTurn",
                     "prizeBonusAmount", "prizeBonusKind"):
@@ -3008,6 +3009,8 @@ def run_random_branch_parity(deck0: list[int], deck1: list[int], *,
             "noSupporterTurn": [-1, -1],
             "noEvolveTurn": [-1, -1],
             "noStadiumTurn": [-1, -1],
+            "discardHandEndTurn": [-1, -1],
+            "discardHandEndThreshold": [0, 0],
             "teamReduceTurn": [-1, -1],
             "teamReduceAmount": [0, 0],
             "teamReduceType": [-1, -1],
@@ -3086,6 +3089,9 @@ def run_random_branch_parity(deck0: list[int], deck1: list[int], *,
                     no_supporter_turn = list(transients["noSupporterTurn"])
                     no_evolve_turn = list(transients["noEvolveTurn"])
                     no_stadium_turn = list(transients["noStadiumTurn"])
+                    discard_hand_end_turn = list(transients["discardHandEndTurn"])
+                    discard_hand_end_threshold = list(
+                        transients["discardHandEndThreshold"])
                     team_reduce_turn = list(transients["teamReduceTurn"])
                     team_reduce_amount = list(transients["teamReduceAmount"])
                     team_reduce_type = list(transients["teamReduceType"])
@@ -3139,6 +3145,8 @@ def run_random_branch_parity(deck0: list[int], deck1: list[int], *,
                         "noSupporterTurn": no_supporter_turn,
                         "noEvolveTurn": no_evolve_turn,
                         "noStadiumTurn": no_stadium_turn,
+                        "discardHandEndTurn": discard_hand_end_turn,
+                        "discardHandEndThreshold": discard_hand_end_threshold,
                         "teamReduceTurn": team_reduce_turn,
                         "teamReduceAmount": team_reduce_amount,
                         "teamReduceType": team_reduce_type,
@@ -3213,6 +3221,10 @@ def run_random_branch_parity(deck0: list[int], deck1: list[int], *,
                     _track_stadium_play_transients(transients, selected_main)
                     _track_iron_defender_play(transients, current, selected_main)
                     _track_prize_bonus_play(transients, current, selected_main)
+                    if selected_main == ("PLAY", 1207):  # Amarys: discard hand
+                        actor = int(current["yourIndex"])       # down to 5 at end of turn
+                        transients["discardHandEndTurn"][actor] = int(current["turn"])
+                        transients["discardHandEndThreshold"][actor] = 5
                     if selected_main == ("PLAY", 1211):
                         actor = int(current["yourIndex"])
                         turn = int(current["turn"])

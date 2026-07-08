@@ -51,6 +51,85 @@ class PpoBenchmarkTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _ppo_indices(total=3, minibatch_size=4, epochs=1, seed=1)
 
+    def test_vector_envs_expose_unified_id_step_api(self) -> None:
+        try:
+            import ptcg_engine as E
+        except ImportError as exc:
+            raise unittest.SkipTest(f"native extension missing: {exc}") from exc
+
+        def assert_id_batch(state: dict, action: dict, n: int) -> None:
+            self.assertEqual(state["in_play"].shape, (n, 2, E.STATE_INPLAY_SLOTS, E.STATE_INPLAY_WIDTH))
+            self.assertEqual(state["zones"].shape, (n, 2, E.STATE_ZONE_COUNT, E.STATE_ZONE_SLOTS))
+            self.assertEqual(state["global"].shape, (n, E.STATE_GLOBAL_WIDTH))
+            self.assertEqual(state["select_options"].shape, (n, E.RL_MAX_ACTIONS, E.STATE_SELECT_OPTION_WIDTH))
+            self.assertEqual(action["meta"].shape, (n, E.ACTION_META_WIDTH))
+            self.assertEqual(action["options"].shape, (n, E.RL_MAX_ACTIONS, E.ACTION_OPTION_WIDTH))
+            self.assertEqual(action["deck"].shape, (n, E.STATE_ZONE_SLOTS))
+            self.assertEqual(action["mask"].shape, (n, E.RL_MAX_ACTIONS))
+            self.assertTrue(np.all(action["mask"].sum(axis=1) > 0))
+
+        for env_cls, has_episode_len in ((E.VectorEnv, False), (E.PpoBatchEnv, True)):
+            env = env_cls(MEGA_LUCARIO, MEGA_LUCARIO, 4, 1)
+            self.assertTrue(hasattr(env, "observe_ids"))
+            self.assertTrue(hasattr(env, "step"))
+            self.assertFalse(hasattr(env, "step_ids"))
+            state, action, player, result = env.observe_ids()
+            assert_id_batch(state, action, env.size())
+            self.assertEqual(player.shape, (env.size(),))
+            self.assertEqual(result.shape, (env.size(),))
+
+            chosen = np.array(
+                [np.flatnonzero(action["mask"][i])[0] for i in range(env.size())],
+                dtype=np.int32,
+            )
+            stepped = env.step(chosen)
+            if has_episode_len:
+                state2, reward, done, action2, player2, result2, episode_len = stepped
+                self.assertEqual(episode_len.shape, (env.size(),))
+            else:
+                state2, reward, done, action2, player2, result2 = stepped
+            assert_id_batch(state2, action2, env.size())
+            self.assertEqual(reward.shape, (env.size(),))
+            self.assertEqual(done.shape, (env.size(),))
+            self.assertEqual(player2.shape, (env.size(),))
+            self.assertEqual(result2.shape, (env.size(),))
+
+    def test_float_feature_env_methods_are_deprecated(self) -> None:
+        try:
+            import ptcg_engine as E
+            import warnings
+        except ImportError as exc:
+            raise unittest.SkipTest(f"native extension missing: {exc}") from exc
+
+        for env_cls in (E.VectorEnv, E.PpoBatchEnv):
+            env = env_cls(MEGA_LUCARIO, MEGA_LUCARIO, 2, 1)
+            state, action, _player, _result = env.observe_ids()
+            chosen = np.array(
+                [np.flatnonzero(action["mask"][i])[0] for i in range(env.size())],
+                dtype=np.int32,
+            )
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                env.step(chosen)
+            self.assertEqual(caught, [])
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                env.observe_features()
+            self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                env.step_features(chosen)
+            self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+
+        env = E.PpoBatchEnv(MEGA_LUCARIO, MEGA_LUCARIO, 2, 1)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            env.action_features()
+        self.assertTrue(any(issubclass(w.category, DeprecationWarning) for w in caught))
+
     def test_torch_masked_samples_are_legal_and_update_changes_params(self) -> None:
         try:
             import ptcg_engine as E

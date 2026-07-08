@@ -2069,6 +2069,7 @@ static void apply_damaged_by_attack_reactive(GameState& st, InPlay& defender,
                                              int attackerSide, int damageDone,
                                              bool defenderBench = false,
                                              int beforeHp = -1) {
+  (void)defenderBench;
   defender.damagedByAttackTurn = st.turn;
   defender.damagedByAttackSide = attackerSide;
   defender.damagedByAttackAmount = damageDone;
@@ -11908,7 +11909,9 @@ static void set_same_player_promote_pending(GameState& st, int who) {
     pd.options.push_back({Atom::S("CARD"), Atom::S("BENCH"), Atom::I(j),
                           Atom::I(p.bench[j].id)});
   st.pending = pd;
-  st.effectStack.push_back({EFF_ABILITY_PROMOTE, 0, 0});
+  EffectFrame promote;
+  promote.effect = EFF_ABILITY_PROMOTE;
+  st.effectStack.push_back(promote);
 }
 
 static void play_antique_fossil(GameState& st, int cardId) {
@@ -12549,7 +12552,10 @@ void apply(GameState& st, const Action& a, const std::vector<int>& tape) {
       st.retreated = true;
       st.turnActionCount += 1;
       int cost = retreat_cost(st, st.yourIndex);
-      st.effectStack.push_back({EFF_RETREAT, cost, 0});
+      EffectFrame retreat;
+      retreat.effect = EFF_RETREAT;
+      retreat.phase = cost;
+      st.effectStack.push_back(retreat);
       if (cost > 0)
         set_discard_energy_pending(st);  // pay the cost first
       else
@@ -12906,7 +12912,11 @@ static void resolve_powerglass(GameState& st, const std::vector<int>& sel) {
 static void continue_active_ko_after_amulet(GameState& st, int taker, int owner,
                                             int prizeValue) {
   if (prizeValue > 0) {
-    st.effectStack.push_back({EFF_PRIZE, prizeValue, taker});
+    EffectFrame prize;
+    prize.effect = EFF_PRIZE;
+    prize.phase = prizeValue;
+    prize.a = taker;
+    st.effectStack.push_back(prize);
     set_prize_pending(st, taker);
   } else if (st.players[owner].bench.empty()) {
     set_result(st, taker, 3);

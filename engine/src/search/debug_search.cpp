@@ -43,13 +43,6 @@ bool has_action(const std::vector<DebugAction>& actions, int key) {
   return false;
 }
 
-const DebugAction* find_action(const std::vector<DebugAction>& actions, int key) {
-  for (const auto& a : actions) {
-    if (a.key == key) return &a;
-  }
-  return nullptr;
-}
-
 std::vector<double> softmax_priors(const std::vector<double>& logits, int n) {
   std::vector<double> priors(std::max(n, 0), 0.0);
   if (n <= 0) return priors;

@@ -46,6 +46,7 @@ endif()
 
 # --- Python binding -------------------------------------------------------
 if(PTCG_ENGINE_BUILD_PYTHON)
+  set(PYBIND11_FINDPYTHON ON)
   find_package(pybind11 CONFIG REQUIRED)
   pybind11_add_module(ptcg_engine src/bindings.cpp)
   target_link_libraries(ptcg_engine PRIVATE ptcg_core)

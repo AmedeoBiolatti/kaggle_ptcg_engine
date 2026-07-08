@@ -48,6 +48,18 @@ static ActionIdView action_id_view_from_options(const RlOptionSet& opts) {
 
 static constexpr int STATE_CARD_SLOTS = 64;
 
+static void warn_deprecated_float_api(const char* api, const char* replacement) {
+  std::string msg(api);
+  msg += " returns engine-generated float features and is deprecated for new training code";
+  if (replacement != nullptr && replacement[0] != '\0') {
+    msg += "; use ";
+    msg += replacement;
+    msg += " instead";
+  }
+  msg += ".";
+  PyErr_WarnEx(PyExc_DeprecationWarning, msg.c_str(), 1);
+}
+
 static py::dict rl_state_ids_py(const GameState& st) {
   using Shape = std::vector<py::ssize_t>;
   py::array_t<int32_t> in_play(
@@ -528,6 +540,21 @@ static GameState load_state(const py::dict& cur) {
     if (py::len(turns) >= 2) {
       st.noStadiumTurn[0] = turns[0].cast<int>();
       st.noStadiumTurn[1] = turns[1].cast<int>();
+    }
+  }
+  if (cur.contains("discardHandEndTurn") && !cur["discardHandEndTurn"].is_none()) {
+    py::list turns = cur["discardHandEndTurn"].cast<py::list>();
+    if (py::len(turns) >= 2) {
+      st.discardHandEndTurn[0] = turns[0].cast<int>();
+      st.discardHandEndTurn[1] = turns[1].cast<int>();
+    }
+  }
+  if (cur.contains("discardHandEndThreshold") &&
+      !cur["discardHandEndThreshold"].is_none()) {
+    py::list ths = cur["discardHandEndThreshold"].cast<py::list>();
+    if (py::len(ths) >= 2) {
+      st.discardHandEndThreshold[0] = ths[0].cast<int>();
+      st.discardHandEndThreshold[1] = ths[1].cast<int>();
     }
   }
   if (cur.contains("lastKoTurn") && !cur["lastKoTurn"].is_none()) {
@@ -1614,6 +1641,161 @@ static py::dict rl_state_ids_complete_py(const GameState& st) {
   return out;
 }
 
+
+static py::dict batched_state_ids_dict(py::array_t<int32_t> in_play,
+                                       py::array_t<int32_t> zones,
+                                       py::array_t<int32_t> counts,
+                                       py::array_t<int32_t> status,
+                                       py::array_t<int32_t> global,
+                                       py::array_t<int32_t> select_meta,
+                                       py::array_t<int32_t> select_options,
+                                       py::array_t<int32_t> select_deck) {
+  py::dict out;
+  out["in_play"] = in_play;
+  out["zones"] = zones;
+  out["player_counts"] = counts;
+  out["player_status"] = status;
+  out["global"] = global;
+  out["select_meta"] = select_meta;
+  out["select_options"] = select_options;
+  out["select_deck"] = select_deck;
+  out["empty_card_id"] = 0;
+  out["unknown_card_id"] = -1;
+  out["zone_hand"] = 0;
+  out["zone_deck"] = 1;
+  out["zone_discard"] = 2;
+  out["zone_prizes"] = 3;
+  return out;
+}
+
+static py::tuple vector_observe_ids_py(VectorEnv& e) {
+  using Shape = std::vector<py::ssize_t>;
+  int n = e.size();
+  py::array_t<int32_t> in_play(
+      Shape{n, 2, STATE_INPLAY_SLOTS, STATE_INPLAY_WIDTH});
+  py::array_t<int32_t> zones(Shape{n, 2, STATE_ZONE_COUNT, STATE_ZONE_SLOTS});
+  py::array_t<int32_t> counts(Shape{n, 2, 5});
+  py::array_t<int32_t> status(Shape{n, 2, 5});
+  py::array_t<int32_t> global(Shape{n, STATE_GLOBAL_WIDTH});
+  py::array_t<int32_t> meta(Shape{n, ACTION_META_WIDTH});
+  py::array_t<int32_t> options(Shape{n, RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
+  py::array_t<int32_t> deck(Shape{n, STATE_ZONE_SLOTS});
+  py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+  py::array_t<int32_t> player(Shape{n}), result(Shape{n});
+  {
+    py::gil_scoped_release rel;
+    e.observe_ids(in_play.mutable_data(), zones.mutable_data(),
+                  counts.mutable_data(), status.mutable_data(),
+                  global.mutable_data(), meta.mutable_data(),
+                  options.mutable_data(), deck.mutable_data(),
+                  mask.mutable_data(), player.mutable_data(),
+                  result.mutable_data());
+  }
+  return py::make_tuple(
+      batched_state_ids_dict(in_play, zones, counts, status, global, meta,
+                             options, deck),
+      action_ids_dict(meta, options, deck, mask), player, result);
+}
+
+static py::tuple vector_step_ids_py(
+    VectorEnv& e,
+    py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+  using Shape = std::vector<py::ssize_t>;
+  int n = e.size();
+  py::array_t<float> reward(Shape{n});
+  py::array_t<uint8_t> done(Shape{n});
+  py::array_t<int32_t> in_play(
+      Shape{n, 2, STATE_INPLAY_SLOTS, STATE_INPLAY_WIDTH});
+  py::array_t<int32_t> zones(Shape{n, 2, STATE_ZONE_COUNT, STATE_ZONE_SLOTS});
+  py::array_t<int32_t> counts(Shape{n, 2, 5});
+  py::array_t<int32_t> status(Shape{n, 2, 5});
+  py::array_t<int32_t> global(Shape{n, STATE_GLOBAL_WIDTH});
+  py::array_t<int32_t> meta(Shape{n, ACTION_META_WIDTH});
+  py::array_t<int32_t> options(Shape{n, RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
+  py::array_t<int32_t> deck(Shape{n, STATE_ZONE_SLOTS});
+  py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+  py::array_t<int32_t> player(Shape{n}), result(Shape{n});
+  {
+    py::gil_scoped_release rel;
+    e.step_ids(actions.data(), reward.mutable_data(), done.mutable_data(),
+               in_play.mutable_data(), zones.mutable_data(),
+               counts.mutable_data(), status.mutable_data(),
+               global.mutable_data(), meta.mutable_data(),
+               options.mutable_data(), deck.mutable_data(),
+               mask.mutable_data(), player.mutable_data(),
+               result.mutable_data());
+  }
+  return py::make_tuple(
+      batched_state_ids_dict(in_play, zones, counts, status, global, meta,
+                             options, deck),
+      reward, done, action_ids_dict(meta, options, deck, mask), player, result);
+}
+
+static py::tuple ppo_observe_ids_py(PpoBatchEnv& e) {
+  using Shape = std::vector<py::ssize_t>;
+  int n = e.size();
+  py::array_t<int32_t> in_play(
+      Shape{n, 2, STATE_INPLAY_SLOTS, STATE_INPLAY_WIDTH});
+  py::array_t<int32_t> zones(Shape{n, 2, STATE_ZONE_COUNT, STATE_ZONE_SLOTS});
+  py::array_t<int32_t> counts(Shape{n, 2, 5});
+  py::array_t<int32_t> status(Shape{n, 2, 5});
+  py::array_t<int32_t> global(Shape{n, STATE_GLOBAL_WIDTH});
+  py::array_t<int32_t> meta(Shape{n, ACTION_META_WIDTH});
+  py::array_t<int32_t> options(Shape{n, RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
+  py::array_t<int32_t> deck(Shape{n, STATE_ZONE_SLOTS});
+  py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+  py::array_t<int32_t> player(Shape{n}), result(Shape{n});
+  {
+    py::gil_scoped_release rel;
+    e.observe_ids(in_play.mutable_data(), zones.mutable_data(),
+                  counts.mutable_data(), status.mutable_data(),
+                  global.mutable_data(), meta.mutable_data(),
+                  options.mutable_data(), deck.mutable_data(),
+                  mask.mutable_data(), player.mutable_data(),
+                  result.mutable_data());
+  }
+  return py::make_tuple(
+      batched_state_ids_dict(in_play, zones, counts, status, global, meta,
+                             options, deck),
+      action_ids_dict(meta, options, deck, mask), player, result);
+}
+
+static py::tuple ppo_step_ids_py(
+    PpoBatchEnv& e,
+    py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+  using Shape = std::vector<py::ssize_t>;
+  int n = e.size();
+  py::array_t<float> reward(Shape{n});
+  py::array_t<uint8_t> done(Shape{n});
+  py::array_t<int32_t> result(Shape{n}), episode_len(Shape{n});
+  py::array_t<int32_t> in_play(
+      Shape{n, 2, STATE_INPLAY_SLOTS, STATE_INPLAY_WIDTH});
+  py::array_t<int32_t> zones(Shape{n, 2, STATE_ZONE_COUNT, STATE_ZONE_SLOTS});
+  py::array_t<int32_t> counts(Shape{n, 2, 5});
+  py::array_t<int32_t> status(Shape{n, 2, 5});
+  py::array_t<int32_t> global(Shape{n, STATE_GLOBAL_WIDTH});
+  py::array_t<int32_t> meta(Shape{n, ACTION_META_WIDTH});
+  py::array_t<int32_t> options(Shape{n, RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
+  py::array_t<int32_t> deck(Shape{n, STATE_ZONE_SLOTS});
+  py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+  py::array_t<int32_t> player(Shape{n});
+  {
+    py::gil_scoped_release rel;
+    e.step_ids(actions.data(), reward.mutable_data(), done.mutable_data(),
+               result.mutable_data(), episode_len.mutable_data(),
+               in_play.mutable_data(), zones.mutable_data(),
+               counts.mutable_data(), status.mutable_data(),
+               global.mutable_data(), meta.mutable_data(),
+               options.mutable_data(), deck.mutable_data(),
+               mask.mutable_data(), player.mutable_data());
+  }
+  return py::make_tuple(
+      batched_state_ids_dict(in_play, zones, counts, status, global, meta,
+                             options, deck),
+      reward, done, action_ids_dict(meta, options, deck, mask), player, result,
+      episode_len);
+}
+
 static py::dict cg_state(const GameState& st) {
   py::dict d;
   d["turn"] = st.turn;
@@ -2459,7 +2641,7 @@ static std::vector<FeatureRecord> feature_records_cached_batch(
   for (py::handle obj : reqs) {
     py::tuple t = obj.cast<py::tuple>();
     GameState state = t[0].cast<GameState>();
-    const RlOptionSet& opts = t[1].cast<const RlOptionSet&>();
+    RlOptionSet opts = t[1].cast<RlOptionSet>();
     int ctx = t[2].cast<int>();
     int n_act = t[3].cast<int>();
     out.push_back(feature_record_cached(state, opts, ctx, n_act, deck, width));
@@ -2515,7 +2697,7 @@ static py::tuple rl_feature_payload_cached_batch(
     py::tuple t = obj.cast<py::tuple>();
     PreparedFeatureReq r;
     r.state = t[0].cast<GameState>();
-    const RlOptionSet& opts = t[1].cast<const RlOptionSet&>();
+    RlOptionSet opts = t[1].cast<RlOptionSet>();
     r.ctx = t[2].cast<int>();
     r.n_act = std::min(std::max(t[3].cast<int>(), 1), RL_MAX_ACTIONS);
     r.descriptors = descriptors_from_option_set(r.state, opts);
@@ -5384,12 +5566,19 @@ PYBIND11_MODULE(ptcg_engine, m) {
   // branch for stochastic chance nodes.
   m.def("rl_encode_obs",
         [](const GameState& st) {
+          PyErr_WarnEx(
+              PyExc_DeprecationWarning,
+              "ptcg_engine.rl_encode_obs() returns engine-generated float "
+              "features and is deprecated for new training code; use "
+              "ptcg_engine.rl_state_ids()/rl_action_ids() instead.",
+              1);
           py::array_t<float> obs(Shape{rl_obs_dim()});
           rl_encode_obs(st, obs.mutable_data());
           return obs;
         },
         py::arg("state"),
-        "Encode one state -> obs[rl_obs_dim()] from the acting player's POV.");
+        "Deprecated dense float observation features. Prefer rl_state_ids() "
+        "and rl_action_ids() for ID-based models.");
   m.def("rl_state_observation", &rl_state_observation_py, py::arg("state"),
         "Structured mover-POV state observation for embedding models. Returns "
         "fixed slot arrays: card_id/owner/area/index/known plus in-play scalars.");
@@ -5423,27 +5612,57 @@ PYBIND11_MODULE(ptcg_engine, m) {
         py::arg("batch"), py::arg("vloss"), py::arg("c_puct"),
         py::arg("dir_alpha"), py::arg("dir_eps"), py::arg("eval_batch"),
         "C++ PUCT tree with batched Python callback for leaf value/prior eval.");
-  m.def("rl_feature_payload", &rl_feature_payload, py::arg("state"),
-        py::arg("deck"), py::arg("width") = 0,
-        "Build native cabt-compatible sparse feature arrays for one decision.");
-  m.def("rl_feature_payload_cached_batch", &rl_feature_payload_cached_batch,
+  m.def("rl_feature_payload",
+        [](const GameState& state, const std::vector<int>& deck, int width) {
+          warn_deprecated_float_api("ptcg_engine.rl_feature_payload()",
+                                    "ID tensor model inputs");
+          return rl_feature_payload(state, deck, width);
+        },
+        py::arg("state"), py::arg("deck"), py::arg("width") = 0,
+        "Deprecated native sparse float feature arrays for one decision.");
+  m.def("rl_feature_payload_cached_batch",
+        [](const py::sequence& reqs, const std::vector<int>& deck, int width) {
+          warn_deprecated_float_api(
+              "ptcg_engine.rl_feature_payload_cached_batch()",
+              "ID tensor model inputs");
+          return rl_feature_payload_cached_batch(reqs, deck, width);
+        },
         py::arg("reqs"), py::arg("deck"), py::arg("width") = 0,
-        "Build native sparse features for prepared (state, options, ctx, n_act) "
-        "requests without Python descriptor/action feature construction.");
-  m.def("rl_feature_record_cached", &feature_record_cached, py::arg("state"),
-        py::arg("options"), py::arg("ctx"), py::arg("n_act"), py::arg("deck"),
-        py::arg("width") = RL_MAX_ACTIONS,
-        "Build one native sparse feature record for training without NumPy "
-        "array allocation during self-play.");
-  m.def("rl_feature_records_cached_batch", &feature_records_cached_batch,
+        "Deprecated native sparse float feature batch builder.");
+  m.def("rl_feature_record_cached",
+        [](const GameState& state, const RlOptionSet& opts, int ctx, int n_act,
+           const std::vector<int>& deck, int width) {
+          warn_deprecated_float_api("ptcg_engine.rl_feature_record_cached()",
+                                    "ID tensor model inputs");
+          return feature_record_cached(state, opts, ctx, n_act, deck, width);
+        },
+        py::arg("state"), py::arg("options"), py::arg("ctx"), py::arg("n_act"),
+        py::arg("deck"), py::arg("width") = RL_MAX_ACTIONS,
+        "Deprecated native sparse float feature record builder.");
+  m.def("rl_feature_records_cached_batch",
+        [](const py::sequence& reqs, const std::vector<int>& deck, int width) {
+          warn_deprecated_float_api(
+              "ptcg_engine.rl_feature_records_cached_batch()",
+              "ID tensor model inputs");
+          return feature_records_cached_batch(reqs, deck, width);
+        },
         py::arg("reqs"), py::arg("deck"), py::arg("width") = RL_MAX_ACTIONS,
-        "Build many native sparse feature records for training in one pybind "
-        "call.");
-  m.def("rl_puct_mcts_feature_callback", &rl_puct_mcts_feature_callback,
+        "Deprecated native sparse float feature record batch builder.");
+  m.def("rl_puct_mcts_feature_callback",
+        [](const GameState& state, const std::vector<int>& deck, int n_sims,
+           uint64_t seed, int batch, double vloss, double c_puct,
+           double dir_alpha, double dir_eps, const py::function& eval_payload) {
+          warn_deprecated_float_api(
+              "ptcg_engine.rl_puct_mcts_feature_callback()",
+              "ID tensor model inputs");
+          return rl_puct_mcts_feature_callback(state, deck, n_sims, seed, batch,
+                                               vloss, c_puct, dir_alpha, dir_eps,
+                                               eval_payload);
+        },
         py::arg("state"), py::arg("deck"), py::arg("n_sims"), py::arg("seed"),
         py::arg("batch"), py::arg("vloss"), py::arg("c_puct"),
         py::arg("dir_alpha"), py::arg("dir_eps"), py::arg("eval_payload"),
-        "C++ PUCT tree with native sparse feature batching and Python NN eval.");
+        "Deprecated C++ PUCT path that batches native sparse float features.");
   m.def("rl_maple_puct_callback", &rl_maple_puct_callback, py::arg("state"),
         py::arg("deck"), py::arg("n_sims"), py::arg("seed"),
         py::arg("dets"), py::arg("c_puct"), py::arg("eval_payload"),
@@ -5494,12 +5713,18 @@ PYBIND11_MODULE(ptcg_engine, m) {
         "indices align with rl_step's `action`.");
   m.def("rl_action_features",
         [](const GameState& st) {
+          PyErr_WarnEx(
+              PyExc_DeprecationWarning,
+              "ptcg_engine.rl_action_features() returns engine-generated "
+              "float features and is deprecated for new training code; use "
+              "ptcg_engine.rl_action_ids() instead.",
+              1);
           py::array_t<float> feat(Shape{RL_MAX_ACTIONS, PPO_ACTION_FEAT_DIM});
           rl_action_features(st, feat.mutable_data());
           return feat;
         },
         py::arg("state"),
-        "Dense descriptor features [RL_MAX_ACTIONS,PPO_ACTION_FEAT_DIM] for PPO.");
+        "Deprecated dense descriptor features. Prefer rl_action_ids().");
   m.def("rl_action_ids", &rl_action_ids_py, py::arg("state"),
         "Packed symbolic legal-action tensors for embedding models and cg-select "
         "reconstruction. Returns meta[16], options[64,24], deck[64], mask[64].");
@@ -5507,6 +5732,10 @@ PYBIND11_MODULE(ptcg_engine, m) {
         "Symbolic legal-action ID tensors.");
   m.def("rl_card_features",
         [](const GameState& st) {
+          PyErr_WarnEx(
+              PyExc_DeprecationWarning,
+              "ptcg_engine.rl_card_features() returns engine-generated float features and is deprecated for new training code; use ID tensors instead.",
+              1);
           py::array_t<float> feat(Shape{PPO_CARD_SLOTS, PPO_CARD_FEAT_DIM});
           rl_card_features(st, feat.mutable_data());
           return feat;
@@ -5515,6 +5744,10 @@ PYBIND11_MODULE(ptcg_engine, m) {
         "Dense card-slot features [PPO_CARD_SLOTS,PPO_CARD_FEAT_DIM] for PPO.");
   m.def("rl_deck_features",
         [](std::vector<int> deck) {
+          PyErr_WarnEx(
+              PyExc_DeprecationWarning,
+              "ptcg_engine.rl_deck_features() returns engine-generated float features and is deprecated for new training code; use ID tensors instead.",
+              1);
           py::array_t<float> feat(Shape{PPO_DECK_SLOTS, PPO_CARD_FEAT_DIM});
           rl_deck_features(deck, feat.mutable_data());
           return feat;
@@ -5523,6 +5756,10 @@ PYBIND11_MODULE(ptcg_engine, m) {
         "Dense full-deck multiset features [PPO_DECK_SLOTS,PPO_CARD_FEAT_DIM].");
   m.def("rl_belief_features",
         [](const GameState& st) {
+          PyErr_WarnEx(
+              PyExc_DeprecationWarning,
+              "ptcg_engine.rl_belief_features() returns engine-generated float features and is deprecated for new training code; use ID tensors instead.",
+              1);
           py::array_t<float> feat(Shape{PPO_BELIEF_SLOTS, PPO_CARD_FEAT_DIM});
           rl_belief_features(st, feat.mutable_data());
           return feat;
@@ -5532,6 +5769,10 @@ PYBIND11_MODULE(ptcg_engine, m) {
         "[PPO_BELIEF_SLOTS,PPO_CARD_FEAT_DIM].");
   m.def("rl_belief_summary",
         [](const GameState& st) {
+          PyErr_WarnEx(
+              PyExc_DeprecationWarning,
+              "ptcg_engine.rl_belief_summary() returns engine-generated float features and is deprecated for new training code; use ID tensors instead.",
+              1);
           py::array_t<float> feat(Shape{PPO_BELIEF_SUMMARY_DIM});
           rl_belief_summary(st, feat.mutable_data());
           return feat;
@@ -5564,8 +5805,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
       "decision or game end.");
 
   py::class_<BatchEnv>(m, "BatchEnv",
-                       "Vectorized self-play env: N games, one masked single-select "
-                       "action space (MAIN + sub-decisions unified), numpy I/O.")
+                       "Deprecated legacy vectorized float-feature env. Prefer VectorEnv "
+                       "or PpoBatchEnv with ID tensors.")
       .def(py::init<std::vector<int>, std::vector<int>, int, uint64_t, int>(),
            py::arg("deck0"), py::arg("deck1"), py::arg("n"), py::arg("seed") = 0,
            py::arg("threads") = 0)
@@ -5574,6 +5815,12 @@ PYBIND11_MODULE(ptcg_engine, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("observe",
            [](BatchEnv& e) {
+             PyErr_WarnEx(
+                 PyExc_DeprecationWarning,
+                 "BatchEnv.observe() returns engine-generated float features "
+                 "and is deprecated for new training code; use VectorEnv/"
+                 "PpoBatchEnv observe_ids() for ID tensors.",
+                 1);
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D});
              py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
@@ -5587,6 +5834,12 @@ PYBIND11_MODULE(ptcg_engine, m) {
       .def("step",
            [](BatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+             PyErr_WarnEx(
+                 PyExc_DeprecationWarning,
+                 "BatchEnv.step() returns engine-generated float features "
+                 "and is deprecated for new training code; use VectorEnv/"
+                 "PpoBatchEnv step() for ID tensors.",
+                 1);
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D}), reward(Shape{n});
              py::array_t<uint8_t> done(Shape{n}), mask(Shape{n, RL_MAX_ACTIONS});
@@ -5611,6 +5864,12 @@ PYBIND11_MODULE(ptcg_engine, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("observe",
            [](VectorEnv& e) {
+             PyErr_WarnEx(
+                 PyExc_DeprecationWarning,
+                 "VectorEnv.observe() returns engine-generated float features "
+                 "and is deprecated for new training code; use "
+                 "VectorEnv.observe_ids() instead.",
+                 1);
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D});
              py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
@@ -5622,7 +5881,28 @@ PYBIND11_MODULE(ptcg_engine, m) {
              }
              return py::make_tuple(obs, mask, player, result);
            },
-           "Return (obs[N,D], legal_mask[N,RL_MAX_ACTIONS], player[N], result[N]).")
+           "Deprecated dense float feature observation. Prefer observe_ids(), "
+           "state_ids(), and action_ids().")
+      .def("observe_features",
+           [](VectorEnv& e) {
+             warn_deprecated_float_api("VectorEnv.observe_features()",
+                                       "VectorEnv.observe_ids()");
+             int n = e.size(), D = rl_obs_dim();
+             py::array_t<float> obs(Shape{n, D});
+             py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+             py::array_t<int32_t> player(Shape{n}), result(Shape{n});
+             {
+               py::gil_scoped_release rel;
+               e.observe(obs.mutable_data(), mask.mutable_data(),
+                         player.mutable_data(), result.mutable_data());
+             }
+             return py::make_tuple(obs, mask, player, result);
+           },
+           "Return deprecated dense float features as "
+           "(obs, legal_mask, player, result). Prefer observe_ids().")
+      .def("observe_ids", &vector_observe_ids_py,
+           "Return (state_ids, action_ids, player, result) without generating "
+           "engine float features.")
       .def("state_ids",
            [](VectorEnv& e) {
              int n = e.size();
@@ -5862,9 +6142,19 @@ PYBIND11_MODULE(ptcg_engine, m) {
            py::arg("state_out"), py::arg("action_out"), py::arg("player"),
            py::arg("result"),
            "Write packed state/action ids plus player/result in one call.")
-      .def("step",
+      .def("step", &vector_step_ids_py, py::arg("actions"),
+           "Step all games and return "
+           "(state_ids, reward, done, action_ids, player, result) without "
+           "generating engine float features.")
+      .def("step_features",
            [](VectorEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+             PyErr_WarnEx(
+                 PyExc_DeprecationWarning,
+                 "VectorEnv.step_features() returns engine-generated float "
+                 "features and is deprecated for new training code; use "
+                 "VectorEnv.step() instead.",
+                 1);
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D}), reward(Shape{n});
              py::array_t<uint8_t> done(Shape{n}), mask(Shape{n, RL_MAX_ACTIONS});
@@ -5878,9 +6168,7 @@ PYBIND11_MODULE(ptcg_engine, m) {
              return py::make_tuple(obs, reward, done, mask, player, result);
            },
            py::arg("actions"),
-           "Step all games with actions[N]; auto-resets finished games. Returns "
-           "(obs[N,D], reward[N], done[N], legal_mask[N,RL_MAX_ACTIONS], "
-           "player[N], result[N]).");
+           "Deprecated dense float feature step. Prefer step().");
   py::class_<PpoBatchEnv>(m, "PpoBatchEnv",
                           "Fully native vector env for PPO rollouts. One policy "
                           "controls the current player in each self-play game; "
@@ -5895,11 +6183,28 @@ PYBIND11_MODULE(ptcg_engine, m) {
       .def("size", &PpoBatchEnv::size)
       .def("reset_all", &PpoBatchEnv::reset_all,
            py::call_guard<py::gil_scoped_release>())
+      .def("observe_ids", &ppo_observe_ids_py,
+           "Return (state_ids, action_ids, player, result) without generating "
+           "engine float features.")
+      .def("state_ids",
+           [](PpoBatchEnv& e) {
+             py::tuple out = ppo_observe_ids_py(e);
+             return out[0].cast<py::dict>();
+           },
+           "Return packed state ID tensors with a leading batch dimension.")
+      .def("action_ids",
+           [](PpoBatchEnv& e) {
+             py::tuple out = ppo_observe_ids_py(e);
+             return out[1].cast<py::dict>();
+           },
+           "Return packed legal-action ID tensors with a leading batch dimension.")
       .def("observe_into",
            [](PpoBatchEnv& e,
               py::array_t<float, py::array::c_style> obs,
               py::array_t<uint8_t, py::array::c_style> mask,
               py::array_t<int32_t, py::array::c_style> player) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_into()",
+                                       "PpoBatchEnv.observe_ids()");
              py::gil_scoped_release rel;
              e.observe(obs.mutable_data(), mask.mutable_data(),
                        player.mutable_data());
@@ -5916,6 +6221,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<float, py::array::c_style> deck_features,
               py::array_t<float, py::array::c_style> belief_features,
               py::array_t<float, py::array::c_style> belief_summary) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_all_features_into()",
+                                       "PpoBatchEnv.observe_ids()");
              py::gil_scoped_release rel;
              e.observe(obs.mutable_data(), mask.mutable_data(),
                        player.mutable_data());
@@ -5939,6 +6246,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<float, py::array::c_style> action_features,
               py::array_t<float, py::array::c_style> card_features,
               py::array_t<float, py::array::c_style> deck_features) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_card_features_into()",
+                                       "PpoBatchEnv.observe_ids()");
              py::gil_scoped_release rel;
              e.observe(obs.mutable_data(), mask.mutable_data(),
                        player.mutable_data());
@@ -5956,6 +6265,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<uint8_t, py::array::c_style> mask,
               py::array_t<int32_t, py::array::c_style> player,
               py::array_t<float, py::array::c_style> action_features) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_action_features_into()",
+                                       "PpoBatchEnv.observe_ids()");
              py::gil_scoped_release rel;
              e.observe(obs.mutable_data(), mask.mutable_data(),
                        player.mutable_data());
@@ -5967,6 +6278,12 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "caller-owned arrays.")
       .def("observe",
            [](PpoBatchEnv& e) {
+             PyErr_WarnEx(
+                 PyExc_DeprecationWarning,
+                 "PpoBatchEnv.observe() returns engine-generated float features "
+                 "and is deprecated for new training code; use "
+                 "PpoBatchEnv.observe_ids() instead.",
+                 1);
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D});
              py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
@@ -5978,9 +6295,28 @@ PYBIND11_MODULE(ptcg_engine, m) {
              }
              return py::make_tuple(obs, mask, player);
            },
-           "Return (obs[N,D], legal_mask[N,RL_MAX_ACTIONS], player[N]).")
+           "Deprecated dense float feature observation. Prefer observe_ids(), "
+           "state_ids(), and action_ids().")
+      .def("observe_features",
+           [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_features()",
+                                       "PpoBatchEnv.observe_ids()");
+             int n = e.size(), D = rl_obs_dim();
+             py::array_t<float> obs(Shape{n, D});
+             py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+             py::array_t<int32_t> player(Shape{n});
+             {
+               py::gil_scoped_release rel;
+               e.observe(obs.mutable_data(), mask.mutable_data(),
+                         player.mutable_data());
+             }
+             return py::make_tuple(obs, mask, player);
+           },
+           "Return deprecated dense float features as (obs, legal_mask, player).")
       .def("observe_with_action_features",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_with_action_features()",
+                                       "PpoBatchEnv.observe_ids()");
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D});
              py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
@@ -5998,6 +6334,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "Return (obs, legal_mask, player, action_features) in one pybind call.")
       .def("action_features",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.action_features()",
+                                       "PpoBatchEnv.action_ids()");
              int n = e.size();
              py::array_t<float> feat(
                  Shape{n, RL_MAX_ACTIONS, PPO_ACTION_FEAT_DIM});
@@ -6011,6 +6349,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "[N,RL_MAX_ACTIONS,PPO_ACTION_FEAT_DIM].")
       .def("card_features",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.card_features()",
+                                       "PpoBatchEnv.state_ids()");
              int n = e.size();
              py::array_t<float> feat(
                  Shape{n, PPO_CARD_SLOTS, PPO_CARD_FEAT_DIM});
@@ -6023,6 +6363,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "Return dense card-slot features [N,PPO_CARD_SLOTS,PPO_CARD_FEAT_DIM].")
       .def("deck_features",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.deck_features()",
+                                       "PpoBatchEnv.state_ids()");
              int n = e.size();
              py::array_t<float> feat(
                  Shape{n, PPO_DECK_SLOTS, PPO_CARD_FEAT_DIM});
@@ -6035,6 +6377,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "Return dense full-deck features [N,PPO_DECK_SLOTS,PPO_CARD_FEAT_DIM].")
       .def("belief_features",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.belief_features()",
+                                       "PpoBatchEnv.state_ids()");
              int n = e.size();
              py::array_t<float> feat(
                  Shape{n, PPO_BELIEF_SLOTS, PPO_CARD_FEAT_DIM});
@@ -6048,6 +6392,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "[N,PPO_BELIEF_SLOTS,PPO_CARD_FEAT_DIM].")
       .def("belief_summary",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.belief_summary()",
+                                       "PpoBatchEnv.state_ids()");
              int n = e.size();
              py::array_t<float> feat(Shape{n, PPO_BELIEF_SUMMARY_DIM});
              {
@@ -6060,6 +6406,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "[N,PPO_BELIEF_SUMMARY_DIM].")
       .def("observe_with_all_features",
            [](PpoBatchEnv& e) {
+             warn_deprecated_float_api("PpoBatchEnv.observe_with_all_features()",
+                                       "PpoBatchEnv.observe_ids()");
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D});
              py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
@@ -6089,9 +6437,19 @@ PYBIND11_MODULE(ptcg_engine, m) {
            },
            "Return (obs, legal_mask, player, action_features, card_features, "
            "deck_features, belief_features, belief_summary).")
-      .def("step",
+      .def("step", &ppo_step_ids_py, py::arg("actions"),
+           "Step all games and return "
+           "(state_ids, reward, done, action_ids, player, result, episode_len) "
+           "without generating engine float features.")
+      .def("step_features",
            [](PpoBatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+             PyErr_WarnEx(
+                 PyExc_DeprecationWarning,
+                 "PpoBatchEnv.step_features() returns engine-generated float "
+                 "features and is deprecated for new training code; use "
+                 "PpoBatchEnv.step() instead.",
+                 1);
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D}), reward(Shape{n});
              py::array_t<uint8_t> done(Shape{n}), mask(Shape{n, RL_MAX_ACTIONS});
@@ -6108,8 +6466,7 @@ PYBIND11_MODULE(ptcg_engine, m) {
                                    episode_len);
            },
            py::arg("actions"),
-           "Step all games with actions[N]. Returns "
-           "(obs, reward, done, legal_mask, player, result, episode_len).")
+           "Deprecated dense float feature step. Prefer step().")
       .def("step_rewards_into",
            [](PpoBatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions,
@@ -6135,6 +6492,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<float, py::array::c_style> obs,
               py::array_t<uint8_t, py::array::c_style> mask,
               py::array_t<int32_t, py::array::c_style> player) {
+             warn_deprecated_float_api("PpoBatchEnv.step_observe_into()",
+                                       "PpoBatchEnv.step()");
              py::gil_scoped_release rel;
              e.step_rewards(actions.data(), reward.mutable_data(),
                             done.mutable_data(), result.mutable_data(),
@@ -6157,6 +6516,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<uint8_t, py::array::c_style> mask,
               py::array_t<int32_t, py::array::c_style> player,
               py::array_t<float, py::array::c_style> action_features) {
+             warn_deprecated_float_api("PpoBatchEnv.step_action_features_into()",
+                                       "PpoBatchEnv.step()");
              py::gil_scoped_release rel;
              e.step_rewards(actions.data(), reward.mutable_data(),
                             done.mutable_data(), result.mutable_data(),
@@ -6182,6 +6543,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<float, py::array::c_style> action_features,
               py::array_t<float, py::array::c_style> card_features,
               py::array_t<float, py::array::c_style> deck_features) {
+             warn_deprecated_float_api("PpoBatchEnv.step_card_features_into()",
+                                       "PpoBatchEnv.step()");
              py::gil_scoped_release rel;
              e.step_card_features(actions.data(), obs.mutable_data(),
                                   reward.mutable_data(), done.mutable_data(),
@@ -6212,6 +6575,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
               py::array_t<float, py::array::c_style> deck_features,
               py::array_t<float, py::array::c_style> belief_features,
               py::array_t<float, py::array::c_style> belief_summary) {
+             warn_deprecated_float_api("PpoBatchEnv.step_all_features_into()",
+                                       "PpoBatchEnv.step()");
              py::gil_scoped_release rel;
              e.step_card_features(actions.data(), obs.mutable_data(),
                                   reward.mutable_data(), done.mutable_data(),
@@ -6233,6 +6598,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
       .def("step_with_action_features",
            [](PpoBatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+             warn_deprecated_float_api("PpoBatchEnv.step_with_action_features()",
+                                       "PpoBatchEnv.step()");
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D}), reward(Shape{n});
              py::array_t<uint8_t> done(Shape{n}), mask(Shape{n, RL_MAX_ACTIONS});
@@ -6256,6 +6623,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
       .def("step_with_card_features",
            [](PpoBatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+             warn_deprecated_float_api("PpoBatchEnv.step_with_card_features()",
+                                       "PpoBatchEnv.step()");
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D}), reward(Shape{n});
              py::array_t<uint8_t> done(Shape{n}), mask(Shape{n, RL_MAX_ACTIONS});
@@ -6283,6 +6652,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
            [](PpoBatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions,
               int repeats) {
+             warn_deprecated_float_api("PpoBatchEnv.profile_step_card_features()",
+                                       "PpoBatchEnv.step()");
              PpoStepProfile p;
              {
                py::gil_scoped_release rel;
@@ -6320,6 +6691,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
       .def("step_with_all_features",
            [](PpoBatchEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+             warn_deprecated_float_api("PpoBatchEnv.step_with_all_features()",
+                                       "PpoBatchEnv.step()");
              int n = e.size(), D = rl_obs_dim();
              py::array_t<float> obs(Shape{n, D}), reward(Shape{n});
              py::array_t<uint8_t> done(Shape{n}), mask(Shape{n, RL_MAX_ACTIONS});

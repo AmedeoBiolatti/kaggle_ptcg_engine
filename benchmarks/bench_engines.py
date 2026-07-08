@@ -321,14 +321,14 @@ def bench_native_vectorized(deck0: list[int], deck1: list[int], *, steps: int,
 
     rng = np.random.default_rng(seed)
     env = E.VectorEnv(deck0, deck1, batch_size, seed)
-    _obs, mask, _player, _result = env.observe()
+    _obs, mask, _player, _result = env.observe_features()
     done_steps = 0
     while done_steps < steps:
         if selector == "first":
             actions = np.zeros(batch_size, dtype=np.int32)
         else:
             actions = _random_actions_from_mask(np.asarray(mask), rng)
-        _obs, _reward, _done, mask, _player, _result = env.step(actions)
+        _obs, _reward, _done, mask, _player, _result = env.step_features(actions)
         done_steps += batch_size
     return done_steps, batch_size
 
@@ -343,7 +343,7 @@ def bench_native_vectorized_action_ids(
 
     rng = np.random.default_rng(seed)
     env = E.VectorEnv(deck0, deck1, batch_size, seed)
-    _obs, mask, _player, _result = env.observe()
+    _obs, mask, _player, _result = env.observe_features()
     done_steps = 0
     while done_steps < steps:
         env.action_ids()
@@ -351,7 +351,7 @@ def bench_native_vectorized_action_ids(
             actions = np.zeros(batch_size, dtype=np.int32)
         else:
             actions = _random_actions_from_mask(np.asarray(mask), rng)
-        _obs, _reward, _done, mask, _player, _result = env.step(actions)
+        _obs, _reward, _done, mask, _player, _result = env.step_features(actions)
         done_steps += batch_size
     return done_steps, batch_size
 
@@ -456,7 +456,7 @@ def bench_native_vectorized_legacy_all_features(
             actions = np.zeros(batch_size, dtype=np.int32)
         else:
             actions = _random_actions_from_mask(np.asarray(mask), rng)
-        _obs, _reward, _done, mask, _player, _result, _episode_len = env.step(actions)
+        _obs, _reward, _done, mask, _player, _result, _episode_len = env.step_features(actions)
         env.observe_with_all_features()
         done_steps += batch_size
     return done_steps, batch_size
@@ -485,7 +485,7 @@ def bench_native_vectorized_nn_adapter(
 
     rng = np.random.default_rng(seed)
     env = E.VectorEnv(deck0, deck1, batch_size, seed)
-    _obs, mask, _player, _result = env.observe()
+    _obs, mask, _player, _result = env.observe_features()
     done_steps = 0
     with torch.inference_mode():
         while done_steps < steps:
@@ -499,7 +499,7 @@ def bench_native_vectorized_nn_adapter(
                 empty = np.asarray(action_ids["mask"]).sum(axis=1) <= 0
                 if np.any(empty):
                     actions[empty] = _random_actions_from_mask(np.asarray(mask)[empty], rng)
-            _obs, _reward, _done, mask, _player, _result = env.step(actions)
+            _obs, _reward, _done, mask, _player, _result = env.step_features(actions)
             done_steps += batch_size
     return done_steps, batch_size
 
@@ -858,7 +858,7 @@ def bench_native_ppo_torch(
             dist = torch.distributions.Categorical(logits=out["logits"])
             action_t = dist.sample()
             actions = action_t.cpu().numpy().astype(np.int32)
-            _obs, reward, done, _mask, _player, _result = env.step(actions)
+            _obs, reward, done, _mask, _player, _result = env.step_features(actions)
             rewards[t] = np.asarray(reward, dtype=np.float32)
             dones[t] = np.asarray(done, dtype=np.float32)
             actions_buf[t] = actions
@@ -1567,7 +1567,7 @@ def bench_native_ppo_jax(
                 action_jax["mask"],
             )
             actions = np.asarray(jax.device_get(action_t), dtype=np.int32)
-            _obs, reward, done, _mask, _player, _result = env.step(actions)
+            _obs, reward, done, _mask, _player, _result = env.step_features(actions)
             (
                 state_buf,
                 action_buf,
