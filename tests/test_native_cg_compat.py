@@ -123,7 +123,7 @@ def _reference_cg_dll_path() -> str | None:
     explicit = os.environ.get("PTCG_REFERENCE_LIB")
     if explicit and os.path.exists(explicit):
         return explicit
-    names = ("cg.dll", "libcg.so")
+    names = ("cg.dll",) if os.name == "nt" else ("libcg.so",)
     workspace = os.path.dirname(ROOT)
     candidates = [
         os.path.join(ROOT, "cg"),

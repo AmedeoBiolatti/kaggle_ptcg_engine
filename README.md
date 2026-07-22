@@ -125,6 +125,43 @@ player, and the caller supplies the action for that player.
 
 See `notebooks/native_vector_env_minimal.ipynb` for a compact example.
 
+For memory-constrained rollouts, `observe_ids16()` and `step16(actions)`
+return the same packed state/action schema with signed `int16` ID arrays:
+
+```python
+state, action, player, result = env.observe_ids16()
+state, reward, done, action, player, result = env.step16(actions)
+```
+
+For allocation-free rollout loops, reuse the first call's buffers:
+
+```python
+import numpy as np
+
+reward = np.empty(env.size(), dtype=np.float32)
+done = np.empty(env.size(), dtype=np.uint8)
+env.step16_into(
+    actions, state, action, reward, done, player, result
+)
+```
+
+Values are checked before narrowing; an out-of-range future schema value raises
+`OverflowError` rather than wrapping. Action option column 18's composite
+reference is losslessly split across columns 18 and 19:
+
+```python
+raw_ref = (
+    action["options"][..., action["raw_ref_low_column"]].astype("int32")
+    + (
+        action["options"][..., action["raw_ref_high_column"]].astype("int32")
+        << action["raw_ref_shift"]
+    )
+)
+```
+
+The compact API leaves rewards as `float32`, masks/done flags as `uint8`,
+and player/result arrays as `int32`.
+
 ## Validation
 
 Run native-only compatibility tests:
@@ -138,6 +175,25 @@ Run random branch parity against a reference `cg` shared library:
 ```bash
 python -m validation.native_compare --deck mega_lucario --games 10 --seed 1
 ```
+
+Run the bounded official-engine regression matrix (strict option order and
+duplicate multiplicity, asymmetric deck pairs, and invalid-deck errors):
+
+```bash
+python -m pytest -q tests/test_reference_parity.py
+```
+
+Run randomized VectorEnv equivalence and packed-schema invariants across int32,
+int16, reusable buffers, serial execution, parallel execution, and automatic
+terminal resets:
+
+```bash
+python -m pytest -q tests/test_vector_env_properties.py
+```
+
+The reference loader checks `PTCG_REFERENCE_LIB`, repository/workspace
+`cg/` directories, and `data/sample_submission/cg/`. If no official library
+is available, the optional official differential tests are skipped.
 
 Runtime shadow mode is available with `PTCG_BACKEND=shadow`. It drives setup
 through the reference engine, bootstraps native from the first post-setup public
@@ -173,6 +229,12 @@ The benchmark reports:
 - `native_vectorized`: batched compact stepping through `ptcg_engine.VectorEnv`.
 - `native_vectorized_action_ids`: batched compact stepping while building packed
   symbolic action tensors.
+- `native_vectorized_ids32`: allocating batched packed-ID stepping with the
+  original signed-`int32` schema.
+- `native_vectorized_ids16`: allocating batched packed-ID stepping with direct
+  checked signed-`int16` encoding.
+- `native_vectorized_ids16_into`: checked signed-`int16` stepping into reused
+  caller-owned buffers.
 
 By default the benchmark only prints rows supported by the loaded extension.
 Use `--include-reference` to also test the original `cg.game` package,

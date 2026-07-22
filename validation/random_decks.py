@@ -1408,8 +1408,22 @@ class RandomDeckGenerator:
         forced: list[int] = []
         if pokemon:
             forced.append(rng.choice(pokemon[: min(120, len(pokemon))]))
-        forced.extend(trainers[:3])
-        forced.extend(energies[:1])
+        # A legal deck may contain only one ACE SPEC. Coordinate Trainer and
+        # Energy picks so the forced set itself is always legal.
+        forced_energy = energies[:1]
+        forced_trainers: list[int] = []
+        ace_spec_selected = any(
+            self.cards[cid].aceSpec for cid in forced + forced_energy
+        )
+        for cid in trainers:
+            if self.cards[cid].aceSpec and ace_spec_selected:
+                continue
+            forced_trainers.append(cid)
+            ace_spec_selected = ace_spec_selected or bool(self.cards[cid].aceSpec)
+            if len(forced_trainers) == 3:
+                break
+        forced.extend(forced_trainers)
+        forced.extend(forced_energy)
         return forced
 
     def _can_add_many(self, deck: Counter, additions: Counter) -> bool:

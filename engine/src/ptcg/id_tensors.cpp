@@ -1,12 +1,64 @@
 #include "ptcg/id_tensors.hpp"
 
+#include "ptcg/card_db.hpp"
+
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <string_view>
 
 namespace ptcg {
 namespace {
+
+template <typename T>
+class IdWriter {
+ public:
+  class Reference {
+   public:
+    Reference(T* value, bool* ok) : value_(value), ok_(ok) {}
+
+    template <typename V>
+    Reference& operator=(V value) {
+      const int64_t wide = static_cast<int64_t>(value);
+      if constexpr (sizeof(T) < sizeof(int32_t)) {
+        if (wide < std::numeric_limits<T>::min() ||
+            wide > std::numeric_limits<T>::max()) {
+          *value_ = 0;
+          *ok_ = false;
+          return *this;
+        }
+      }
+      *value_ = static_cast<T>(wide);
+      return *this;
+    }
+
+   private:
+    T* value_;
+    bool* ok_;
+  };
+
+  IdWriter(T* data, bool* ok) : data_(data), ok_(ok) {}
+
+  Reference operator[](size_t index) const {
+    return Reference(data_ + index, ok_);
+  }
+  IdWriter operator+(size_t offset) const {
+    return IdWriter(data_ + offset, ok_);
+  }
+  void clear(size_t count) const {
+    std::fill(data_, data_ + count, static_cast<T>(0));
+  }
+
+ private:
+  T* data_;
+  bool* ok_;
+};
+
+template <typename T>
+IdWriter<T> id_writer(T* data, bool* ok) {
+  return IdWriter<T>(data, ok);
+}
 
 constexpr int CG_AREA_DECK = 1;
 constexpr int CG_AREA_HAND = 2;
@@ -186,7 +238,9 @@ int cg_infer_card_owner(const GameState& st, int fallback,
                         std::string_view area, int index, int cardId) {
   if (area == "STADIUM")
     return st.stadiumOwner >= 0 ? st.stadiumOwner : fallback;
-  if (area != "ACTIVE" && area != "BENCH" && area != "PRIZE")
+  if (area != "ACTIVE" && area != "BENCH" && area != "PRIZE" &&
+      area != "HAND" && area != "DISCARD" && area != "DECK" &&
+      area != "LOOKING")
     return fallback;
 
   int match = -1;
@@ -201,6 +255,19 @@ int cg_infer_card_owner(const GameState& st, int fallback,
     } else if (area == "PRIZE") {
       if (index >= 0 && index < static_cast<int>(p.prizes.size()))
         cid = p.prizes[index];
+    } else if (area == "HAND") {
+      if (index >= 0 && index < static_cast<int>(p.hand.size()))
+        cid = p.hand[index];
+    } else if (area == "DISCARD") {
+      if (index >= 0 && index < static_cast<int>(p.discard.size()))
+        cid = p.discard[index];
+    } else if (area == "DECK") {
+      if (index >= 0 && index < static_cast<int>(p.deck.size()))
+        cid = p.deck[index];
+    } else if (area == "LOOKING") {
+      const int deck_index = static_cast<int>(p.deck.size()) - 1 - index;
+      if (deck_index >= 0 && deck_index < static_cast<int>(p.deck.size()))
+        cid = p.deck[deck_index];
     }
     if (cid <= 0 || (cardId > 0 && cid != cardId)) continue;
     if (match >= 0) return fallback;
@@ -347,9 +414,112 @@ int action_target_card_id(const GameState& st, int owner, std::string_view area,
   return 0;
 }
 
+constexpr int ATTACK_DEFINITION_SLOTS_PER_CARD = 4;
+
+int attack_definition_key_for_card(int cardId, int attackId) {
+  if (cardId <= 0 || attackId <= 0) return 0;
+  const CardInfo* card = find_card(cardId);
+  if (!card) return 0;
+  for (int slot = 0; slot < card->n_attacks; ++slot) {
+    if (card->attacks[slot].id == attackId)
+      return cardId * ATTACK_DEFINITION_SLOTS_PER_CARD + slot + 1;
+  }
+  return 0;
+}
+
+int resolved_attack_definition_key(const GameState& st, const Descriptor& d,
+                                   int selectType) {
+  const int attackId = desc_int(d, 1);
+  if (attackId <= 0 || st.yourIndex < 0 || st.yourIndex > 1) return 0;
+
+  // Copied-attack selection descriptors carry their precise source card in
+  // the fourth atom.  Prefer it over reconstructing context from the board.
+  if (d.size() >= 4) {
+    const int explicitSourceCardId = desc_int(d, 3);
+    if (const int key =
+            attack_definition_key_for_card(explicitSourceCardId, attackId))
+      return key;
+  }
+
+  const Player& me = st.players[st.yourIndex];
+  const Player& opp = st.players[1 - st.yourIndex];
+
+  if (selectType == CG_SELECT_ATTACK) {
+    // Bespoke/VM copied-attack choices may keep the source only on the active
+    // effect frame (for example Slowking's Seek Inspiration).
+    if (!st.effectStack.empty()) {
+      if (const int key = attack_definition_key_for_card(
+              st.effectStack.back().sourceCardId, attackId))
+        return key;
+    }
+    if (opp.activeKnown) {
+      if (const int key =
+              attack_definition_key_for_card(opp.active.id, attackId))
+        return key;
+    }
+    if (me.activeKnown) {
+      if (const int key =
+              attack_definition_key_for_card(me.active.id, attackId))
+        return key;
+    }
+    return 0;
+  }
+
+  if (!me.activeKnown) return 0;
+
+  // Zoroark/Clefable replace their printed copy attack with the opponent's
+  // Active attacks in the main-action list.
+  if (me.active.id == 615 || me.active.id == 958) {
+    if (opp.activeKnown) {
+      if (const int key =
+              attack_definition_key_for_card(opp.active.id, attackId))
+        return key;
+    }
+  }
+
+  // N's Zoroark ex offers attacks from eligible Benched N's Pokemon.  Attack
+  // IDs are unique in this card database, so the matching bench occurrence is
+  // the resolved source selected by the engine.
+  if (me.active.id == 293) {
+    for (const InPlay& benched : me.bench) {
+      if (const int key =
+              attack_definition_key_for_card(benched.id, attackId))
+        return key;
+    }
+  }
+
+  if (const int key = attack_definition_key_for_card(me.active.id, attackId))
+    return key;
+
+  // Relicanth's Memory Dive offers printed attacks from the Active's actual
+  // pre-evolution chain.
+  for (int preEvolutionId : me.active.preEvo) {
+    if (const int key =
+            attack_definition_key_for_card(preEvolutionId, attackId))
+      return key;
+  }
+
+  // Lillie's Clefairy ex can receive Core Memory's Geobuster from the Tool.
+  if (me.active.id == 1056 && attackId == 1556)
+    return attack_definition_key_for_card(1180, attackId);
+  return 0;
+}
+
+template <bool Compact, typename T>
+void write_raw_reference(IdWriter<T> row, int value) {
+  if constexpr (Compact) {
+    row[ACTION_RAW_REF_LOW_COLUMN] =
+        value & ((1 << ACTION_RAW_REF_SHIFT) - 1);
+    row[ACTION_RAW_REF_HIGH_COLUMN] = value >> ACTION_RAW_REF_SHIFT;
+  } else {
+    row[ACTION_RAW_REF_LOW_COLUMN] = value;
+  }
+}
+
+template <bool Compact, typename T>
 void encode_action_id_option(const GameState& st, const Descriptor& d,
                              CgHandIndexResolver& hand, int selectType,
-                             int actionIndex, int32_t* row) {
+                             int actionIndex, IdWriter<T> row) {
   const int me = st.yourIndex;
   const std::string_view kind =
       d.empty() ? std::string_view("END") : desc_str(d, 0);
@@ -360,7 +530,9 @@ void encode_action_id_option(const GameState& st, const Descriptor& d,
     row[1] = CG_OPTION_END;
   } else if (kind == "PLAY") {
     row[1] = CG_OPTION_PLAY;
+    row[3] = CG_AREA_HAND;
     row[4] = hand.index_for(d, desc_int(d, 1));
+    row[5] = 0;
     row[8] = desc_int(d, 1);
   } else if (kind == "SETUP_ACTIVE") {
     row[1] = CG_OPTION_CARD;
@@ -393,6 +565,8 @@ void encode_action_id_option(const GameState& st, const Descriptor& d,
   } else if (kind == "ATTACK") {
     row[1] = CG_OPTION_ATTACK;
     row[10] = desc_int(d, 1);
+    row[ACTION_ATTACK_DEFINITION_COLUMN] =
+        resolved_attack_definition_key(st, d, selectType);
   } else if (kind == "RETREAT") {
     row[1] = CG_OPTION_RETREAT;
     row[3] = CG_AREA_ACTIVE;
@@ -430,16 +604,25 @@ void encode_action_id_option(const GameState& st, const Descriptor& d,
       row[8] = cardId;
       row[9] = action_target_card_id(st, owner, area, inplayIdx);
       row[15] = toolIdx;
-      row[18] = rawIndex;
+      write_raw_reference<Compact>(row, rawIndex);
     } else {
       owner = cg_infer_card_owner(st, me, area, rawIndex, cardId);
       row[1] = CG_OPTION_CARD;
       row[3] = cg_area_code(area);
-      row[4] = cg_area_index(area, rawIndex);
+      int semanticIndex = cg_area_index(area, rawIndex);
+      if (area == "DECK" && owner >= 0 && owner < 2 && rawIndex >= 0 &&
+          rawIndex < static_cast<int>(st.players[owner].deck.size())) {
+        // Engine deck vectors are bottom-first, while observation deck slots
+        // and model positions are top-first.  Keep the engine reference in
+        // columns 18/19 and expose only this canonical top-distance here.
+        semanticIndex = static_cast<int>(st.players[owner].deck.size()) - 1 -
+                        rawIndex;
+      }
+      row[4] = semanticIndex;
       row[5] = action_owner_pov(owner, me);
       row[8] = cardId;
       row[9] = action_target_card_id(st, owner, area, rawIndex);
-      row[18] = rawIndex;
+      write_raw_reference<Compact>(row, rawIndex);
     }
   } else if (kind == "ENERGY") {
     std::string_view area = desc_str(d, 1);
@@ -461,7 +644,7 @@ void encode_action_id_option(const GameState& st, const Descriptor& d,
     row[13] = energyIdx;
     if (!attachedCardSelect)
       row[14] = cg_energy_count(st, owner, inplayIdx, energyIdx);
-    row[18] = ref;
+    write_raw_reference<Compact>(row, ref);
   } else if (kind == "YES") {
     row[1] = CG_OPTION_YES;
   } else if (kind == "NO") {
@@ -488,15 +671,22 @@ ActionIdView action_id_view(const std::vector<Descriptor>& descriptors) {
                       &descriptors};
 }
 
-void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
-                           int32_t* ct, int32_t* stt, int32_t* gl) {
+template <typename T>
+bool fill_observation_ids_impl(const GameState& st, T* ip_data, T* zn_data,
+                               T* ct_data, T* stt_data, T* gl_data) {
+  bool ok = true;
+  auto ip = id_writer(ip_data, &ok);
+  auto zn = id_writer(zn_data, &ok);
+  auto ct = id_writer(ct_data, &ok);
+  auto stt = id_writer(stt_data, &ok);
+  auto gl = id_writer(gl_data, &ok);
   const int me = st.yourIndex;
 
-  std::fill(ip, ip + 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH, 0);
-  std::fill(zn, zn + 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS, 0);
-  std::fill(ct, ct + 2 * 5, 0);
-  std::fill(stt, stt + 2 * 5, 0);
-  std::fill(gl, gl + STATE_GLOBAL_WIDTH, 0);
+  ip.clear(2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH);
+  zn.clear(2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS);
+  ct.clear(2 * 5);
+  stt.clear(2 * 5);
+  gl.clear(STATE_GLOBAL_WIDTH);
 
   auto inplay_row = [&](int pov, int slot) {
     return ip + (pov * STATE_INPLAY_SLOTS + slot) * STATE_INPLAY_WIDTH;
@@ -507,12 +697,37 @@ void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
   auto encode_card_value = [](bool present, bool known, int cid) {
     return !present ? 0 : (known ? cid : -1);
   };
+  auto turn_phase = [&](int effect_turn) {
+    if (effect_turn < st.turn) return 0;
+    const int delta = effect_turn - st.turn;
+    return delta == 0 ? 1 : (delta == 1 ? 2 : 3);
+  };
+  auto bounded = [](int value, int maximum, bool& clipped) {
+    if (value < 0) {
+      clipped = true;
+      return 0;
+    }
+    if (value > maximum) {
+      clipped = true;
+      return maximum;
+    }
+    return value;
+  };
+  auto damage_units = [&](int value, int maximum, bool& clipped) {
+    if (value < 0) {
+      clipped = true;
+      return 0;
+    }
+    if (value % 10 != 0) clipped = true;
+    return bounded(value / 10, maximum, clipped);
+  };
 
   for (int pov = 0; pov < 2; ++pov) {
-    const Player& p = st.players[pov == 0 ? me : 1 - me];
+    const int owner = pov == 0 ? me : 1 - me;
+    const Player& p = st.players[owner];
     for (int slot = 0; slot < STATE_INPLAY_SLOTS; ++slot) {
       const InPlay* pk = state_inplay_at_slot(p, slot);
-      int32_t* row = inplay_row(pov, slot);
+      auto row = inplay_row(pov, slot);
       row[3] = slot == 0 ? AREA_ACTIVE : AREA_BENCH;
       row[4] = slot == 0 ? 0 : slot - 1;
       if (!pk) continue;
@@ -541,8 +756,170 @@ void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
       row[10] = static_cast<int>(pk->energyCardIds.size());
       row[11] = static_cast<int>(pk->tools.size());
       row[12] = static_cast<int>(pk->preEvo.size());
-      row[13] = pk->lockId;
+      row[13] = pk->lockTurn == st.turn ? pk->lockId : 0;
       row[14] = pk->activeLockId;
+
+      // The first two words contain seven independent 2-bit turn phases each.
+      // Values are emitted only while their phase is observable, so stale
+      // lifecycle residue cannot leak into the model input.
+      const int dmg_reduce_phase = turn_phase(pk->dmgReduceTurn);
+      const int attack_cost_phase = turn_phase(pk->attackCostModTurn);
+      const int retreat_cost_phase = turn_phase(pk->retreatCostModTurn);
+      const int delayed_damage_phase = turn_phase(pk->delayedDamageTurn);
+      const int delayed_ko_phase = turn_phase(pk->delayedKoTurn);
+      const int prevent_damage_phase = turn_phase(pk->preventDmgTurn);
+      const int prevent_effects_phase = turn_phase(pk->preventEffectsTurn);
+      const int flip_fail_phase = turn_phase(pk->attackFlipFailTurn);
+      const int no_weakness_phase = turn_phase(pk->noWeaknessTurn);
+      const int take_more_phase = turn_phase(pk->takeMoreDamageTurn);
+      const int next_attack_phase = turn_phase(pk->nextAttackBonusTurn);
+      const int reactive_damage_phase =
+          turn_phase(pk->damagedByAttackCountersTurn);
+      const int reactive_equal_phase =
+          turn_phase(pk->damagedByAttackEqualCountersTurn);
+      const int energy_reactive_phase =
+          turn_phase(pk->energyAttachCountersTurn);
+      const int attack_reduce_phase = turn_phase(pk->attackDmgReduceTurn);
+      const int attack_bonus_phase = turn_phase(pk->attackBonusTurn);
+
+      row[STATE_INPLAY_EFFECT_PHASES_0_COLUMN] =
+          dmg_reduce_phase | (attack_cost_phase << 2) |
+          (retreat_cost_phase << 4) | (delayed_damage_phase << 6) |
+          (delayed_ko_phase << 8) | (prevent_damage_phase << 10) |
+          (prevent_effects_phase << 12);
+      row[STATE_INPLAY_EFFECT_PHASES_1_COLUMN] =
+          flip_fail_phase | (no_weakness_phase << 2) |
+          (take_more_phase << 4) | (next_attack_phase << 6) |
+          (reactive_damage_phase << 8) | (reactive_equal_phase << 10) |
+          (energy_reactive_phase << 12);
+
+      int history_age = 0;
+      if (pk->damagedByAttackTurn >= 0 &&
+          pk->damagedByAttackTurn <= st.turn) {
+        const int age = st.turn - pk->damagedByAttackTurn;
+        history_age = age == 0 ? 1 : (age == 1 ? 2 : 3);
+      }
+      bool values_clipped = false;
+      int effect_meta = attack_reduce_phase | (attack_bonus_phase << 2);
+      effect_meta |= pk->delayedKoPromoteBeforePrize && delayed_ko_phase
+                         ? (1 << 4)
+                         : 0;
+      effect_meta |= pk->energyAttachCountersFromHandOnly &&
+                             energy_reactive_phase
+                         ? (1 << 5)
+                         : 0;
+      const int reactive_status =
+          reactive_damage_phase && pk->damagedByAttackStatus >= 0
+              ? bounded(pk->damagedByAttackStatus + 1, 7, values_clipped)
+              : 0;
+      effect_meta |= reactive_status << 6;
+      effect_meta |= history_age << 9;
+      effect_meta |= history_age && pk->damagedByAttackSide >= 0 &&
+                             pk->damagedByAttackSide != owner
+                         ? (1 << 11)
+                         : 0;
+      effect_meta |= slot == 0 && p.poisoned && p.poisonDamageCounters > 1
+                         ? (1 << 12)
+                         : 0;
+      effect_meta |= next_attack_phase && pk->nextAttackSetBase >= 0
+                         ? (1 << 13)
+                         : 0;
+
+      const int dmg_reduce = dmg_reduce_phase
+                                 ? damage_units(pk->dmgReduce, 63,
+                                                values_clipped)
+                                 : 0;
+      const int attack_damage_reduce =
+          attack_reduce_phase
+              ? damage_units(pk->attackDmgReduce, 31, values_clipped)
+              : 0;
+      const int attack_cost =
+          attack_cost_phase
+              ? bounded(pk->attackCostMod, 3, values_clipped)
+              : 0;
+      const int retreat_cost =
+          retreat_cost_phase
+              ? bounded(pk->retreatCostMod, 3, values_clipped)
+              : 0;
+      row[STATE_INPLAY_EFFECT_VALUES_0_COLUMN] =
+          dmg_reduce | (attack_damage_reduce << 6) | (attack_cost << 11) |
+          (retreat_cost << 13);
+
+      const int prevent_damage_cond =
+          prevent_damage_phase
+              ? bounded(pk->preventDmgCond, 7, values_clipped)
+              : 0;
+      const int prevent_damage_value =
+          prevent_damage_phase
+              ? damage_units(pk->preventDmgValue, 63, values_clipped)
+              : 0;
+      const int take_more = take_more_phase
+                                ? damage_units(pk->takeMoreDamage, 63,
+                                               values_clipped)
+                                : 0;
+      row[STATE_INPLAY_EFFECT_VALUES_1_COLUMN] =
+          prevent_damage_cond | (prevent_damage_value << 3) |
+          (take_more << 9);
+
+      const int prevent_effects_cond =
+          prevent_effects_phase
+              ? bounded(pk->preventEffectsCond, 7, values_clipped)
+              : 0;
+      const int prevent_effects_value =
+          prevent_effects_phase
+              ? damage_units(pk->preventEffectsValue, 63, values_clipped)
+              : 0;
+      const int delayed_counters =
+          delayed_damage_phase
+              ? bounded(pk->delayedDamageCounters, 63, values_clipped)
+              : 0;
+      row[STATE_INPLAY_EFFECT_VALUES_2_COLUMN] =
+          prevent_effects_cond | (prevent_effects_value << 3) |
+          (delayed_counters << 9);
+
+      const int last_damage =
+          history_age
+              ? damage_units(pk->damagedByAttackAmount, 63, values_clipped)
+              : 0;
+      const int hp_before =
+          history_age
+              ? damage_units(pk->damagedByAttackBeforeHp, 63, values_clipped)
+              : 0;
+      const int reactive_counters =
+          reactive_damage_phase
+              ? bounded(pk->damagedByAttackCounters, 7, values_clipped)
+              : 0;
+      row[STATE_INPLAY_EFFECT_VALUES_3_COLUMN] =
+          last_damage | (hp_before << 6) | (reactive_counters << 12);
+
+      const int next_attack_id =
+          next_attack_phase
+              ? bounded(pk->nextAttackBonusId, 2047, values_clipped)
+              : 0;
+      const int next_attack_additive =
+          next_attack_phase
+              ? damage_units(pk->nextAttackBonus, 15, values_clipped)
+              : 0;
+      row[STATE_INPLAY_EFFECT_VALUES_4_COLUMN] =
+          next_attack_id | (next_attack_additive << 11);
+
+      const int next_attack_set_base =
+          next_attack_phase && pk->nextAttackSetBase >= 0
+              ? damage_units(pk->nextAttackSetBase, 62, values_clipped) + 1
+              : 0;
+      const int direct_attack_bonus =
+          attack_bonus_phase
+              ? damage_units(pk->attackBonus, 31, values_clipped)
+              : 0;
+      const int energy_reactive_counters =
+          energy_reactive_phase
+              ? bounded(pk->energyAttachCounters, 15, values_clipped)
+              : 0;
+      row[STATE_INPLAY_EFFECT_VALUES_5_COLUMN] =
+          next_attack_set_base | (direct_attack_bonus << 6) |
+          (energy_reactive_counters << 11);
+      if (values_clipped) effect_meta |= 1 << 14;
+      row[STATE_INPLAY_EFFECT_META_COLUMN] = effect_meta;
 
       int e_limit = std::min(
           STATE_MAX_ATTACHED_ENERGY,
@@ -568,13 +945,15 @@ void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
 
   for (int pov = 0; pov < 2; ++pov) {
     const Player& p = st.players[pov == 0 ? me : 1 - me];
-    int32_t* hand = zone_row(pov, 0);
-    int32_t* deck = zone_row(pov, 1);
-    int32_t* discard = zone_row(pov, 2);
-    int32_t* prizes = zone_row(pov, 3);
+    const bool owner_pov = pov == 0;
+    auto hand = zone_row(pov, 0);
+    auto deck = zone_row(pov, 1);
+    auto discard = zone_row(pov, 2);
+    auto prizes = zone_row(pov, 3);
     for (int i = 0; i < STATE_ZONE_SLOTS; ++i) {
       if (i < p.handCount) {
-        bool known = p.handKnown && i < static_cast<int>(p.hand.size());
+        bool known = (owner_pov ? p.handKnown : p.handPublicKnown) &&
+                     i < static_cast<int>(p.hand.size());
         int cid = known ? p.hand[i] : -1;
         if (!known && i < static_cast<int>(p.handKnownCards.size())) {
           known = true;
@@ -586,12 +965,13 @@ void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
       if (i < p.deckCount) {
         int deck_idx = static_cast<int>(p.deck.size()) - 1 - i;
         bool has_ordered = deck_idx >= 0;
-        bool known = p.deckKnown ||
+        bool known = (p.deckKnown && (!p.ownDeckInspected || owner_pov)) ||
                      (deck_idx >= 0 &&
                       deck_idx < static_cast<int>(p.deckKnownMask.size()) &&
-                      p.deckKnownMask[deck_idx]);
+                      p.deckKnownMask[deck_idx] &&
+                      (!p.ownDeckInspected || owner_pov));
         int cid = has_ordered ? p.deck[deck_idx] : -1;
-        if ((!has_ordered || !known) &&
+        if ((!has_ordered || !known) && (!p.ownDeckInspected || owner_pov) &&
             i < static_cast<int>(p.deckKnownCards.size())) {
           known = true;
           cid = p.deckKnownCards[i];
@@ -604,15 +984,41 @@ void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
       }
     }
 
+    std::vector<int> inferred_prizes;
+    if (owner_pov && p.ownPrizesInferred) {
+      inferred_prizes.assign(p.prizes.begin(), p.prizes.end());
+      // Slot-known cards (especially face-up Prizes) keep their physical
+      // positions and must be removed once from the unordered remainder.
+      for (int slot = 0; slot < p.prizeCount; ++slot) {
+        const bool slot_known = p.prizesKnown ||
+            (slot < static_cast<int>(p.prizesKnownMask.size()) &&
+             p.prizesKnownMask[slot]) ||
+            (slot < static_cast<int>(p.prizeFaceUp.size()) &&
+             p.prizeFaceUp[slot]);
+        if (!slot_known || slot >= static_cast<int>(p.prizes.size())) continue;
+        auto it = std::find(inferred_prizes.begin(), inferred_prizes.end(),
+                            p.prizes[slot]);
+        if (it != inferred_prizes.end()) inferred_prizes.erase(it);
+      }
+      std::sort(inferred_prizes.begin(), inferred_prizes.end());
+    }
+    int inferred_index = 0;
     for (int i = 0; i < STATE_PRIZE_SLOTS; ++i) {
       if (i >= p.prizeCount) continue;
       bool face_up = i < static_cast<int>(p.prizeFaceUp.size()) &&
                      p.prizeFaceUp[i];
       bool known = p.prizesKnown ||
                    (i < static_cast<int>(p.prizesKnownMask.size()) &&
-                    p.prizesKnownMask[i]) ||
-                   face_up;
+                    p.prizesKnownMask[i]) || face_up;
       int cid = i < static_cast<int>(p.prizes.size()) ? p.prizes[i] : -1;
+      if (!known && owner_pov && p.ownPrizesInferred &&
+          inferred_index < static_cast<int>(inferred_prizes.size())) {
+        // Exact deduction gives an unordered multiset, never a mapping from
+        // identities to physical face-down Prize slots. Emit its canonical
+        // sorted representation so compatible slot permutations agree.
+        known = true;
+        cid = inferred_prizes[inferred_index++];
+      }
       if ((cid <= 0 || !known) &&
           i < static_cast<int>(p.prizesKnownCards.size())) {
         known = true;
@@ -658,20 +1064,134 @@ void fill_observation_ids(const GameState& st, int32_t* ip, int32_t* zn,
   gl[21] = st.players[me].handKnown ? 1 : 0;
   gl[22] = st.players[1 - me].handKnown ? 1 : 0;
   gl[23] = st.players[me].deckKnown ? 1 : 0;
-  gl[24] = st.players[1 - me].deckKnown ? 1 : 0;
-  gl[25] = st.players[me].prizesKnown ? 1 : 0;
+  gl[24] = st.players[1 - me].deckKnown &&
+                   !st.players[1 - me].ownDeckInspected
+               ? 1
+               : 0;
+  gl[25] = (st.players[me].prizesKnown ||
+            st.players[me].ownPrizesInferred) ? 1 : 0;
   gl[26] = st.players[1 - me].prizesKnown ? 1 : 0;
+
+  // All qualifier and value fields share the one saturation bit in the
+  // trailing values word. Keep clipping state across every packing lambda so
+  // an out-of-domain qualifier can never silently alias a valid code.
+  bool global_values_clipped = false;
+  auto restriction_word = [&](int side, bool turn_flag) {
+    const int item_phase = turn_phase(st.noItemTurn[side]);
+    const int supporter_phase = turn_phase(st.noSupporterTurn[side]);
+    const int evolve_phase = turn_phase(st.noEvolveTurn[side]);
+    const int stadium_phase = turn_phase(st.noStadiumTurn[side]);
+    const int low_energy_phase = turn_phase(st.noAttackEnergyLeTurn[side]);
+    const int threshold =
+        low_energy_phase
+            ? bounded(st.noAttackEnergyLeThreshold[side] + 1, 7,
+                      global_values_clipped)
+            : 0;
+    const bool shared_ability_used =
+        st.abilityGroupUsedTurn[side][3] == st.turn;
+    return item_phase | (supporter_phase << 2) | (evolve_phase << 4) |
+           (stadium_phase << 6) | (low_energy_phase << 8) |
+           (threshold << 10) | (shared_ability_used ? (1 << 13) : 0) |
+           (turn_flag ? (1 << 14) : 0);
+  };
+  gl[STATE_GLOBAL_RESTRICTIONS_SELF_COLUMN] =
+      restriction_word(me, st.lunarUsedThisTurn);
+  gl[STATE_GLOBAL_RESTRICTIONS_OPP_COLUMN] =
+      restriction_word(1 - me, st.canariPlayed);
+
+  auto global_effect_word = [&](int side) {
+    const int discard_phase = turn_phase(st.discardHandEndTurn[side]);
+    const int team_phase = turn_phase(st.teamReduceTurn[side]);
+    const int active_ex_phase = turn_phase(st.activeExDamageBuffTurn[side]);
+    const int prize_phase = turn_phase(st.prizeBonusTurn[side]);
+    const int hand_threshold =
+        discard_phase
+            ? bounded(st.discardHandEndThreshold[side], 7,
+                      global_values_clipped)
+            : 0;
+    const int team_type =
+        team_phase && st.teamReduceType[side] >= 0
+            ? bounded(st.teamReduceType[side] + 1, 15,
+                      global_values_clipped)
+            : 0;
+    return discard_phase | (team_phase << 2) | (active_ex_phase << 4) |
+           (prize_phase << 6) | (hand_threshold << 8) |
+           (team_type << 11);
+  };
+  gl[STATE_GLOBAL_EFFECTS_SELF_COLUMN] = global_effect_word(me);
+  gl[STATE_GLOBAL_EFFECTS_OPP_COLUMN] = global_effect_word(1 - me);
+
+  auto team_stacked = [&](int side) {
+    if (!turn_phase(st.teamReduceTurn[side])) return 0;
+    if (st.teamReduceAmount[side] != 30 && st.teamReduceAmount[side] != 60)
+      global_values_clipped = true;
+    return st.teamReduceAmount[side] > 30 ? 1 : 0;
+  };
+  auto active_ex_code = [&](int side) {
+    if (!turn_phase(st.activeExDamageBuffTurn[side])) return 0;
+    const int units =
+        damage_units(st.activeExDamageBuffAmount[side], 6,
+                     global_values_clipped);
+    if (units < 3) {
+      global_values_clipped = true;
+      return 0;
+    }
+    return units - 3;
+  };
+  const int self_team_stacked = team_stacked(me);
+  const int opp_team_stacked = team_stacked(1 - me);
+  const int self_active_ex_code = active_ex_code(me);
+  const int opp_active_ex_code = active_ex_code(1 - me);
+  const int self_prize_amount =
+      turn_phase(st.prizeBonusTurn[me])
+          ? bounded(st.prizeBonusAmount[me], 3, global_values_clipped)
+          : 0;
+  const int opp_prize_amount =
+      turn_phase(st.prizeBonusTurn[1 - me])
+          ? bounded(st.prizeBonusAmount[1 - me], 3, global_values_clipped)
+          : 0;
+  const int self_prize_kind =
+      turn_phase(st.prizeBonusTurn[me])
+          ? bounded(st.prizeBonusKind[me], 1, global_values_clipped)
+          : 0;
+  const int opp_prize_kind =
+      turn_phase(st.prizeBonusTurn[1 - me])
+          ? bounded(st.prizeBonusKind[1 - me], 1, global_values_clipped)
+          : 0;
+  const int fighting_present = st.fightingBuff > 0 ? 1 : 0;
+  if (st.fightingBuff != 0 && st.fightingBuff != 30)
+    global_values_clipped = true;
+  gl[STATE_GLOBAL_EFFECT_VALUES_COLUMN] =
+      self_team_stacked | (opp_team_stacked << 1) |
+      (self_active_ex_code << 2) | (opp_active_ex_code << 4) |
+      (self_prize_amount << 6) | (opp_prize_amount << 8) |
+      (self_prize_kind << 10) | (opp_prize_kind << 11) |
+      (fighting_present << 12) | (st.tarragonPlayed ? (1 << 13) : 0) |
+      (global_values_clipped ? (1 << 14) : 0);
+  return ok;
 }
 
-void fill_action_ids(const GameState& st, ActionIdView ids, int32_t* meta,
-                     int32_t* options, int32_t* deck, uint8_t* mask) {
+void fill_observation_ids(const GameState& st, int32_t* in_play,
+                          int32_t* zones, int32_t* player_counts,
+                          int32_t* player_status, int32_t* global) {
+  fill_observation_ids_impl(st, in_play, zones, player_counts, player_status,
+                            global);
+}
+
+template <bool Compact, typename T>
+bool fill_action_ids_impl(const GameState& st, ActionIdView ids, T* meta_data,
+                          T* options_data, T* deck_data, uint8_t* mask) {
+  bool ok = true;
+  auto meta = id_writer(meta_data, &ok);
+  auto options = id_writer(options_data, &ok);
+  auto deck = id_writer(deck_data, &ok);
   CgActionView view = action_view_from_id_view(st, ids);
   const int selectType = cg_select_type_from_view(view);
   const int n_options =
       std::min(static_cast<int>(view.descriptors.size()), ACTION_MAX_OPTIONS);
-  std::fill(meta, meta + ACTION_META_WIDTH, 0);
-  std::fill(options, options + ACTION_MAX_OPTIONS * ACTION_OPTION_WIDTH, 0);
-  std::fill(deck, deck + STATE_ZONE_SLOTS, 0);
+  meta.clear(ACTION_META_WIDTH);
+  options.clear(ACTION_MAX_OPTIONS * ACTION_OPTION_WIDTH);
+  deck.clear(STATE_ZONE_SLOTS);
   if (mask) std::memset(mask, 0, ACTION_MAX_OPTIONS);
 
   meta[0] = view.ctx < 0 ? CG_CONTEXT_MAIN : view.ctx;
@@ -686,8 +1206,9 @@ void fill_action_ids(const GameState& st, ActionIdView ids, int32_t* meta,
 
   CgHandIndexResolver hand(st.players[st.yourIndex]);
   for (int i = 0; i < n_options; ++i) {
-    encode_action_id_option(st, view.descriptors[i], hand, selectType, i,
-                            options + i * ACTION_OPTION_WIDTH);
+    encode_action_id_option<Compact>(
+        st, view.descriptors[i], hand, selectType, i,
+        options + i * ACTION_OPTION_WIDTH);
     if (mask) mask[i] = 1;
   }
 
@@ -703,6 +1224,24 @@ void fill_action_ids(const GameState& st, ActionIdView ids, int32_t* meta,
     }
   }
   meta[5] = max_deck_idx + 1;
+  return ok;
+}
+
+void fill_action_ids(const GameState& st, ActionIdView ids, int32_t* meta,
+                     int32_t* options, int32_t* deck, uint8_t* mask) {
+  fill_action_ids_impl<false>(st, ids, meta, options, deck, mask);
+}
+
+bool fill_observation_ids16(const GameState& st, int16_t* in_play,
+                            int16_t* zones, int16_t* player_counts,
+                            int16_t* player_status, int16_t* global) {
+  return fill_observation_ids_impl(st, in_play, zones, player_counts,
+                                   player_status, global);
+}
+
+bool fill_action_ids16(const GameState& st, ActionIdView view, int16_t* meta,
+                       int16_t* options, int16_t* deck, uint8_t* mask) {
+  return fill_action_ids_impl<true>(st, view, meta, options, deck, mask);
 }
 
 ObservationIds make_observation_ids(const GameState& st) {

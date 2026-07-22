@@ -9,7 +9,10 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <random>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -37,6 +40,177 @@ static inline uint64_t rl_rand(uint64_t& s) {
   s ^= s >> 7;
   s ^= s << 17;
   return s;
+}
+
+GameState rl_determinize_own_hidden(const GameState& state,
+                                    const std::vector<int>& decklist,
+                                    int perspective, uint64_t seed) {
+  if (perspective != 0 && perspective != 1)
+    throw std::invalid_argument("perspective must be 0 or 1");
+  if (state.has_pending() || !state.effectStack.empty())
+    throw std::invalid_argument(
+        "own-hidden determinization requires a stable main-decision root");
+  if (decklist.empty())
+    throw std::invalid_argument("submitted decklist must not be empty");
+
+  const Player& source = state.players[perspective];
+  if (source.handCount != static_cast<int>(source.hand.size()))
+    throw std::invalid_argument(
+        "own hand identities must be exact before determinization");
+
+  std::map<int, int> remaining;
+  for (int id : decklist) {
+    if (id <= 0)
+      throw std::invalid_argument("decklist contains a non-positive card id");
+    ++remaining[id];
+  }
+  auto consume = [&](int id, const char* context) {
+    if (id <= 0) return;
+    auto it = remaining.find(id);
+    if (it == remaining.end() || it->second <= 0)
+      throw std::invalid_argument(std::string("deck constraint conflict at ") +
+                                  context + " for card " +
+                                  std::to_string(id));
+    if (--it->second == 0) remaining.erase(it);
+  };
+  auto consume_inplay = [&](const InPlay& pokemon) {
+    consume(pokemon.id, "in-play Pokemon");
+    for (int id : pokemon.energyCardIds) consume(id, "attached Energy");
+    for (int id : pokemon.tools) consume(id, "attached Tool");
+    for (int id : pokemon.preEvo) consume(id, "pre-evolution stack");
+  };
+
+  if (source.activePresent) {
+    if (!source.activeKnown)
+      throw std::invalid_argument("own Active identity is unknown");
+    consume_inplay(source.active);
+  }
+  for (const InPlay& pokemon : source.bench) consume_inplay(pokemon);
+  for (int id : source.hand) consume(id, "own hand");
+  for (int id : source.discard) consume(id, "own discard");
+  if (state.pendingTrainerOwner == perspective)
+    consume(state.pendingTrainerDiscard, "resolving Trainer");
+  if (state.stadiumOwner == perspective)
+    for (int id : state.stadium) consume(id, "owned Stadium");
+
+  int hidden_count = 0;
+  for (const auto& [id, count] : remaining) {
+    (void)id;
+    hidden_count += count;
+  }
+  if (hidden_count != source.deckCount + source.prizeCount)
+    throw std::invalid_argument(
+        "decklist remainder does not match Deck plus Prize counts");
+
+  std::vector<int> hidden_union;
+  hidden_union.reserve(static_cast<std::size_t>(hidden_count));
+  for (const auto& [id, count] : remaining)
+    for (int i = 0; i < count; ++i) hidden_union.push_back(id);
+  if (!source.deckPrizeKnownCards.empty()) {
+    std::vector<int> known(source.deckPrizeKnownCards.begin(),
+                           source.deckPrizeKnownCards.end());
+    std::sort(known.begin(), known.end());
+    if (known != hidden_union)
+      throw std::invalid_argument(
+          "known Deck/Prize union conflicts with submitted decklist");
+  }
+
+  std::vector<int> sampled_deck(static_cast<std::size_t>(source.deckCount), 0);
+  std::vector<int> sampled_prizes(
+      static_cast<std::size_t>(source.prizeCount), 0);
+  auto extract = [&](int id, const char* context) {
+    auto it = std::find(hidden_union.begin(), hidden_union.end(), id);
+    if (it == hidden_union.end())
+      throw std::invalid_argument(std::string("hidden constraint conflict at ") +
+                                  context + " for card " +
+                                  std::to_string(id));
+    hidden_union.erase(it);
+  };
+
+  if (source.deckKnown &&
+      static_cast<int>(source.deck.size()) != source.deckCount)
+    throw std::invalid_argument("known Deck lacks exact ordered identities");
+  for (int slot = 0; slot < source.deckCount; ++slot) {
+    const bool known = source.deckKnown ||
+        (slot < static_cast<int>(source.deckKnownMask.size()) &&
+         source.deckKnownMask[slot]);
+    if (!known) continue;
+    if (slot >= static_cast<int>(source.deck.size()) ||
+        source.deck[slot] <= 0)
+      throw std::invalid_argument("known Deck slot lacks an identity");
+    sampled_deck[slot] = source.deck[slot];
+    extract(sampled_deck[slot], "known Deck slot");
+  }
+
+  if (source.prizesKnown &&
+      static_cast<int>(source.prizes.size()) != source.prizeCount)
+    throw std::invalid_argument("known Prizes lack exact identities");
+  for (int slot = 0; slot < source.prizeCount; ++slot) {
+    const bool face_up = slot < static_cast<int>(source.prizeFaceUp.size()) &&
+                         source.prizeFaceUp[slot];
+    const bool known = source.prizesKnown || face_up ||
+        (slot < static_cast<int>(source.prizesKnownMask.size()) &&
+         source.prizesKnownMask[slot]);
+    if (!known) continue;
+    if (slot >= static_cast<int>(source.prizes.size()) ||
+        source.prizes[slot] <= 0)
+      throw std::invalid_argument("known Prize slot lacks an identity");
+    sampled_prizes[slot] = source.prizes[slot];
+    extract(sampled_prizes[slot], "known Prize slot");
+  }
+
+  auto place_members = [&](const auto& members, std::vector<int>& zone,
+                           const char* context) {
+    for (int id : members) {
+      auto slot = std::find(zone.begin(), zone.end(), 0);
+      if (slot == zone.end())
+        throw std::invalid_argument(std::string(context) +
+                                    " exceeds available zone slots");
+      extract(id, context);
+      *slot = id;
+    }
+  };
+  place_members(source.deckKnownCards, sampled_deck,
+                "known unordered Deck membership");
+  place_members(source.prizesKnownCards, sampled_prizes,
+                "known unordered Prize membership");
+
+  std::mt19937_64 sampling_rng(seed ? seed : 1);
+  if (source.ownPrizesInferred) {
+    if (static_cast<int>(source.prizes.size()) != source.prizeCount)
+      throw std::invalid_argument(
+          "inferred Prize multiset lacks exact owner identities");
+    std::vector<int> inferred(source.prizes.begin(), source.prizes.end());
+    for (int id : sampled_prizes) {
+      if (id <= 0) continue;
+      auto it = std::find(inferred.begin(), inferred.end(), id);
+      if (it == inferred.end())
+        throw std::invalid_argument(
+            "known Prize slot conflicts with inferred multiset");
+      inferred.erase(it);
+    }
+    std::sort(inferred.begin(), inferred.end());
+    std::shuffle(inferred.begin(), inferred.end(), sampling_rng);
+    place_members(inferred, sampled_prizes, "inferred Prize multiset");
+  }
+
+  std::shuffle(hidden_union.begin(), hidden_union.end(), sampling_rng);
+  std::size_t cursor = 0;
+  for (int& id : sampled_deck)
+    if (id == 0) id = hidden_union.at(cursor++);
+  for (int& id : sampled_prizes)
+    if (id == 0) id = hidden_union.at(cursor++);
+  if (cursor != hidden_union.size())
+    throw std::logic_error("determinizer left unassigned hidden cards");
+
+  GameState out = state;
+  Player& sampled = out.players[perspective];
+  sampled.deck.assign(sampled_deck.begin(), sampled_deck.end());
+  sampled.prizes.assign(sampled_prizes.begin(), sampled_prizes.end());
+  // Knowledge metadata describes the real information state, not the sampled
+  // world's temporary completion, and is intentionally copied unchanged.
+  out.rng = state.rng;
+  return out;
 }
 
 // splitmix64 finalizer: derive well-separated per-game RNG streams from
@@ -73,18 +247,24 @@ class EnvPool {
     return pool;
   }
 
-  // threads: 0 = auto, 1 = serial, >1 currently treated as auto.
+  // threads: 0 = auto, 1 = serial, >1 = total participants including caller.
   void run(int n, int threads, const std::function<void(int)>& fn) {
     if (n <= 0) return;
-    if (threads == 1 || n < kMinParallel || workers_.empty()) {
+    const int min_parallel =
+        workers_.size() >= 16 ? kMinParallelHighCore : kMinParallel;
+    if (threads == 1 || n < min_parallel || workers_.empty()) {
       for (int i = 0; i < n; ++i) fn(i);
       return;
     }
+    const int participants =
+        threads > 1 ? std::min(threads, static_cast<int>(workers_.size()) + 1)
+                    : static_cast<int>(workers_.size()) + 1;
     std::lock_guard<std::mutex> job_lock(job_mutex_);  // one job at a time
     {
       std::lock_guard<std::mutex> lk(m_);
       fn_ = &fn;
       count_ = n;
+      worker_limit_ = participants - 1;
       next_.store(0, std::memory_order_relaxed);
       in_flight_ = 1;  // the calling thread
       ++generation_;
@@ -100,16 +280,18 @@ class EnvPool {
   }
 
  private:
-  // Measured on this workload: batches of 64 lose ~10% to pool wake/sync
-  // overhead while 256 gains 2.2x — parallelize only from 128 games up.
+  // Waking a full machine's worker set costs more than it saves for small
+  // batches. Batch 256 comfortably amortizes the synchronization overhead;
+  // batch 128 does not on high-core-count CPUs.
   static constexpr int kMinParallel = 128;
+  static constexpr int kMinParallelHighCore = 192;
 
   EnvPool() {
     unsigned hw = std::thread::hardware_concurrency();
     int n_workers = static_cast<int>(hw > 1 ? hw - 1 : 0);
     if (n_workers > 31) n_workers = 31;
     for (int t = 0; t < n_workers; ++t)
-      workers_.emplace_back([this] { worker_loop(); });
+      workers_.emplace_back([this, t] { worker_loop(t); });
   }
 
   ~EnvPool() {
@@ -121,7 +303,7 @@ class EnvPool {
     for (auto& w : workers_) w.join();
   }
 
-  void worker_loop() {
+  void worker_loop(int worker_id) {
     uint64_t seen = 0;
     for (;;) {
       const std::function<void(int)>* fn = nullptr;
@@ -133,7 +315,10 @@ class EnvPool {
         seen = generation_;
         fn = fn_;  // may be null if this job already fully completed
         count = count_;
-        if (fn) ++in_flight_;
+        if (fn && worker_id < worker_limit_)
+          ++in_flight_;
+        else
+          fn = nullptr;
       }
       if (!fn) continue;
       work(fn, count);
@@ -160,6 +345,7 @@ class EnvPool {
   const std::function<void(int)>* fn_ = nullptr;
   int count_ = 0;
   int in_flight_ = 0;
+  int worker_limit_ = 0;
   uint64_t generation_ = 0;
   bool stop_ = false;
   std::atomic<int> next_{0};
@@ -1402,6 +1588,21 @@ void VectorEnv::reset(int i) {
   advance_to_agent(games_[i], rngs_[i], &opts_[i]);
 }
 
+void VectorEnv::step_one(int i, int action, float& reward, uint8_t& done) {
+  const int actor = games_[i].yourIndex;
+  apply_choice_cached(games_[i], opts_[i], action);
+  advance_to_agent(games_[i], rngs_[i], &opts_[i]);
+  const int game_result = games_[i].result;
+  if (game_result < 0) {
+    reward = 0.f;
+    done = 0;
+    return;
+  }
+  reward = game_result == 2 ? 0.f : (game_result == actor ? 1.f : -1.f);
+  done = 1;
+  reset(i);
+}
+
 void VectorEnv::reset_all() {
   EnvPool::instance().run(size(), threads_, [&](int i) { reset(i); });
 }
@@ -1442,23 +1643,39 @@ void VectorEnv::observe_ids(int32_t* in_play, int32_t* zones,
   });
 }
 
+bool VectorEnv::observe_ids16(
+    int16_t* in_play, int16_t* zones, int16_t* player_counts,
+    int16_t* player_status, int16_t* global, int16_t* action_meta,
+    int16_t* action_options, int16_t* action_deck, uint8_t* action_mask,
+    int32_t* player, int32_t* result) const {
+  std::atomic<bool> ok{true};
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    const GameState& st = games_[i];
+    bool row_ok = fill_observation_ids16(
+        st, in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    row_ok = fill_action_ids16(
+                 st, action_id_view_from_options(opts_[i]),
+                 action_meta + i * ACTION_META_WIDTH,
+                 action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+                 action_deck + i * STATE_ZONE_SLOTS,
+                 action_mask + i * RL_MAX_ACTIONS) &&
+             row_ok;
+    if (!row_ok) ok.store(false, std::memory_order_relaxed);
+    player[i] = st.yourIndex;
+    result[i] = st.result;
+  });
+  return ok.load(std::memory_order_relaxed);
+}
+
 void VectorEnv::step(const int* actions, float* obs, float* reward,
                      uint8_t* done, uint8_t* mask, int32_t* player,
                      int32_t* result) {
   int D = RL_OBS_DIM;
   EnvPool::instance().run(size(), threads_, [&](int i) {
-    int actor = games_[i].yourIndex;
-    apply_choice_cached(games_[i], opts_[i], actions[i]);
-    advance_to_agent(games_[i], rngs_[i], &opts_[i]);
-    int r = games_[i].result;
-    if (r >= 0) {
-      reward[i] = (r == 2) ? 0.f : (r == actor ? 1.f : -1.f);
-      done[i] = 1;
-      reset(i);
-    } else {
-      reward[i] = 0.f;
-      done[i] = 0;
-    }
+    step_one(i, actions[i], reward[i], done[i]);
     rl_encode_obs(games_[i], obs + i * D);
     fill_legal_mask(opts_[i], mask + i * RL_MAX_ACTIONS);
     player[i] = games_[i].yourIndex;
@@ -1474,18 +1691,7 @@ void VectorEnv::step_ids(const int* actions, float* reward, uint8_t* done,
                          uint8_t* action_mask, int32_t* player,
                          int32_t* result) {
   EnvPool::instance().run(size(), threads_, [&](int i) {
-    int actor = games_[i].yourIndex;
-    apply_choice_cached(games_[i], opts_[i], actions[i]);
-    advance_to_agent(games_[i], rngs_[i], &opts_[i]);
-    int r = games_[i].result;
-    if (r >= 0) {
-      reward[i] = (r == 2) ? 0.f : (r == actor ? 1.f : -1.f);
-      done[i] = 1;
-      reset(i);
-    } else {
-      reward[i] = 0.f;
-      done[i] = 0;
-    }
+    step_one(i, actions[i], reward[i], done[i]);
 
     const GameState& st = games_[i];
     fill_observation_ids(
@@ -1503,6 +1709,35 @@ void VectorEnv::step_ids(const int* actions, float* reward, uint8_t* done,
     player[i] = st.yourIndex;
     result[i] = st.result;
   });
+}
+
+bool VectorEnv::step_ids16(
+    const int* actions, float* reward, uint8_t* done, int16_t* in_play,
+    int16_t* zones, int16_t* player_counts, int16_t* player_status,
+    int16_t* global, int16_t* action_meta, int16_t* action_options,
+    int16_t* action_deck, uint8_t* action_mask, int32_t* player,
+    int32_t* result) {
+  std::atomic<bool> ok{true};
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    step_one(i, actions[i], reward[i], done[i]);
+    const GameState& st = games_[i];
+    bool row_ok = fill_observation_ids16(
+        st, in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    row_ok = fill_action_ids16(
+                 st, action_id_view_from_options(opts_[i]),
+                 action_meta + i * ACTION_META_WIDTH,
+                 action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+                 action_deck + i * STATE_ZONE_SLOTS,
+                 action_mask + i * RL_MAX_ACTIONS) &&
+             row_ok;
+    if (!row_ok) ok.store(false, std::memory_order_relaxed);
+    player[i] = st.yourIndex;
+    result[i] = st.result;
+  });
+  return ok.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -2107,11 +2342,120 @@ int rl_meta_beam_action(const GameState& st, int inner_mode, int beam_width,
   return best_root;
 }
 
+namespace {
+
+SmallVec<int, 64> public_zone_cards_for_observer(const GameState& st,
+                                                 int observer) {
+  const Player& p = st.players[1 - std::clamp(observer, 0, 1)];
+  SmallVec<int, 64> cards;
+  const auto append = [&](int card) {
+    if (card > 0) cards.push_back(card);
+  };
+  if (p.handKnown) {
+    for (int card : p.hand) append(card);
+  } else {
+    for (int card : p.handKnownCards) append(card);
+  }
+  if (!p.ownDeckInspected) {
+    if (p.deckKnown) {
+      for (int card : p.deck) append(card);
+    } else {
+      const int count =
+          std::min<int>(p.deck.size(), p.deckKnownMask.size());
+      for (int i = 0; i < count; ++i) {
+        if (p.deckKnownMask[static_cast<std::size_t>(i)])
+          append(p.deck[static_cast<std::size_t>(i)]);
+      }
+      for (int card : p.deckKnownCards) append(card);
+    }
+  }
+  for (int card : p.discard) append(card);
+  if (p.prizesKnown) {
+    for (int card : p.prizes) append(card);
+  } else {
+    const int count = std::min<int>(
+        p.prizes.size(),
+        std::max(p.prizesKnownMask.size(), p.prizeFaceUp.size()));
+    for (int i = 0; i < count; ++i) {
+      const bool mask_known =
+          i < static_cast<int>(p.prizesKnownMask.size()) &&
+          p.prizesKnownMask[static_cast<std::size_t>(i)];
+      const bool face_up =
+          i < static_cast<int>(p.prizeFaceUp.size()) &&
+          p.prizeFaceUp[static_cast<std::size_t>(i)];
+      if (mask_known || face_up) append(p.prizes[static_cast<std::size_t>(i)]);
+    }
+    for (int card : p.prizesKnownCards) append(card);
+  }
+  return cards;
+}
+
+template <typename T>
+bool write_public_card_memory(const SmallVec<int, 64>& memory, T* out) {
+  std::fill(out, out + PPO_DECK_SLOTS, static_cast<T>(0));
+  bool ok = true;
+  const int count =
+      std::min<int>(PPO_DECK_SLOTS, static_cast<int>(memory.size()));
+  for (int i = 0; i < count; ++i) {
+    const int card = memory[static_cast<std::size_t>(i)];
+    if (card > static_cast<int>(std::numeric_limits<T>::max())) ok = false;
+    out[i] = static_cast<T>(card);
+  }
+  return ok;
+}
+
+std::array<int, PPO_PUBLIC_EVENT_WIDTH> empty_public_event() {
+  std::array<int, PPO_PUBLIC_EVENT_WIDTH> event{};
+  for (int column = 6; column <= 9; ++column) event[column] = -1;
+  return event;
+}
+
+template <typename T>
+bool write_public_events(const PpoPublicEventRing& ring, int observer,
+                         int current_turn, T* out) {
+  std::memset(out, 0,
+              PPO_PUBLIC_EVENT_SLOTS * PPO_PUBLIC_EVENT_WIDTH * sizeof(T));
+  bool ok = true;
+  const int first_out = PPO_PUBLIC_EVENT_SLOTS - ring.size;
+  for (int i = 0; i < ring.size; ++i) {
+    const auto& event = ring.events[static_cast<std::size_t>(
+        (ring.begin + i) % PPO_PUBLIC_EVENT_SLOTS)];
+    T* row = out + (first_out + i) * PPO_PUBLIC_EVENT_WIDTH;
+    const auto checked_store = [&](int column, int value) {
+      if constexpr (sizeof(T) < sizeof(int)) {
+        if (value < static_cast<int>(std::numeric_limits<T>::min()) ||
+            value > static_cast<int>(std::numeric_limits<T>::max()))
+          ok = false;
+      }
+      row[column] = static_cast<T>(value);
+    };
+    row[0] = static_cast<T>(event[0]);
+    row[1] = static_cast<T>(event[1] < 0 ? 0 : (event[1] == observer ? 1 : 2));
+    row[2] = static_cast<T>(event[2] < 0 ? 0 : (event[2] == observer ? 1 : 2));
+    checked_store(3, event[3]);
+    checked_store(4, event[4]);
+    checked_store(5, event[5]);
+    row[6] = static_cast<T>(event[6] < 0 ? 0 : event[6] + 1);
+    row[7] = static_cast<T>(event[7] < 0 ? 0 : event[7] + 1);
+    row[8] = static_cast<T>(event[8] < 0 ? 0 : event[8] + 1);
+    row[9] = static_cast<T>(event[9] < 0 ? 0 : event[9] + 1);
+    checked_store(10, event[10]);
+    row[11] = static_cast<T>(
+        std::clamp(current_turn - event[11], 0, 32767));
+  }
+  return ok;
+}
+
+}  // namespace
+
 PpoBatchEnv::PpoBatchEnv(std::vector<int> deck0, std::vector<int> deck1, int n,
                          uint64_t seed, int max_steps, double prize_weight,
                          int learner_seat, int opponent_mode, int reward_mode,
-                         int threads)
+                         int threads, bool persistent_public_card_memory,
+                         bool public_event_history)
     : deck0_(std::move(deck0)), deck1_(std::move(deck1)),
+      persistent_public_card_memory_(persistent_public_card_memory),
+      public_event_history_enabled_(public_event_history),
       threads_(threads),
       max_steps_(std::max(1, max_steps)),
       prize_weight_(std::clamp(prize_weight, 0.0, 1.0)),
@@ -2124,17 +2468,406 @@ PpoBatchEnv::PpoBatchEnv(std::vector<int> deck0, std::vector<int> deck1, int n,
   opts_.resize(n);
   episode_len_.assign(n, 0);
   last_prize_score_.assign(n, 0.0f);
+  if (persistent_public_card_memory_ || public_event_history_enabled_) {
+    public_card_memory_.resize(static_cast<std::size_t>(n));
+    public_card_snapshot_.resize(static_cast<std::size_t>(n));
+  }
+  if (public_event_history_enabled_)
+    public_event_history_.resize(static_cast<std::size_t>(n));
+  active_assignments_.resize(n);
+  completed_assignments_.resize(n);
+  lane_episode_counters_.assign(n, 0);
   reset_all();
 }
 
+namespace {
+uint64_t assignment_mix(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+void validate_assignment_deck(const std::vector<int>& deck,
+                              std::size_t candidate_index, int seat) {
+  constexpr std::size_t kDeckCards = 60;
+  constexpr int kMaxPrintedNameCopies = 4;
+  const std::string context =
+      "assignment plan candidate " + std::to_string(candidate_index) +
+      " deck" + std::to_string(seat);
+  if (deck.size() != kDeckCards) {
+    throw std::invalid_argument(
+        context + " must contain exactly 60 cards (got " +
+        std::to_string(deck.size()) + ")");
+  }
+
+  bool has_basic_pokemon = false;
+  int ace_spec_count = 0;
+  std::unordered_map<std::string, int> printed_name_counts;
+  for (std::size_t slot = 0; slot < deck.size(); ++slot) {
+    const int card_id = deck[slot];
+    if (card_id <= 0) {
+      throw std::invalid_argument(
+          context + " has non-positive card id " +
+          std::to_string(card_id) + " at slot " + std::to_string(slot));
+    }
+    const CardInfo* card = find_card(card_id);
+    if (card == nullptr) {
+      throw std::invalid_argument(
+          context + " has unknown native catalog card id " +
+          std::to_string(card_id) + " at slot " + std::to_string(slot));
+    }
+    // CardInfo::name is the generated native catalog's canonical printed-name
+    // copy group. Only Basic Energy is exempt from the normal four-copy rule.
+    if (card->cardType != BASIC_ENERGY) {
+      if (card->name == nullptr || card->name[0] == '\0') {
+        throw std::invalid_argument(
+            context + " card id " + std::to_string(card_id) +
+            " lacks native printed-name metadata");
+      }
+      const int copies = ++printed_name_counts[card->name];
+      if (copies > kMaxPrintedNameCopies) {
+        throw std::invalid_argument(
+            context + " exceeds the four-copy printed-name limit for \"" +
+            card->name + "\"");
+      }
+    }
+    if (card->aceSpec && ++ace_spec_count > 1) {
+      throw std::invalid_argument(
+          context + " contains more than one ACE SPEC card");
+    }
+    has_basic_pokemon |= card->cardType == POKEMON && card->basic;
+  }
+  if (!has_basic_pokemon) {
+    throw std::invalid_argument(
+        context + " must contain at least one Basic Pokemon");
+  }
+}
+}  // namespace
+
+void PpoBatchEnv::publish_assignment_plan(PpoAssignmentPlan plan) {
+  if (plan.plan_token == 0 || plan.distribution_token == 0 ||
+      plan.candidates.empty()) {
+    throw std::invalid_argument("assignment plan requires nonzero IDs and candidates");
+  }
+  double total = 0.0;
+  for (std::size_t candidate_index = 0;
+       candidate_index < plan.candidates.size(); ++candidate_index) {
+    auto& candidate = plan.candidates[candidate_index];
+    if (candidate.entry.provider1_token == 0) candidate.entry.provider1_token = candidate.entry.provider_token;
+    if (candidate.entry.policy1_token == 0) candidate.entry.policy1_token = candidate.entry.policy_token;
+    if (candidate.entry.version1_token == 0) candidate.entry.version1_token = candidate.entry.version_token;
+    if (!std::isfinite(candidate.weight) || candidate.weight <= 0.0 ||
+        candidate.entry.entry_token == 0 || candidate.entry.provider_token == 0 ||
+        candidate.entry.policy_token == 0 || candidate.entry.version_token == 0 ||
+        candidate.entry.provider1_token == 0 || candidate.entry.policy1_token == 0 ||
+        candidate.entry.version1_token == 0 ||
+        candidate.entry.deck0.empty() || candidate.entry.deck1.empty() ||
+        candidate.entry.trainable_owner_mask > 3 ||
+        candidate.entry.learner_seat < -1 || candidate.entry.learner_seat > 1) {
+      throw std::invalid_argument("invalid assignment plan candidate");
+    }
+    // Validate immutable deck artifacts before the plan can become visible to
+    // resets. Do not construct a game here: malformed setup data must fail on
+    // the publishing thread rather than entering setup or a worker reset.
+    validate_assignment_deck(candidate.entry.deck0, candidate_index, 0);
+    validate_assignment_deck(candidate.entry.deck1, candidate_index, 1);
+    total += candidate.weight;
+  }
+  if (!std::isfinite(total)) {
+    throw std::invalid_argument("assignment plan weights overflow");
+  }
+  plan.total_weight = total;
+  plan.cumulative_weights.clear();
+  plan.cumulative_weights.reserve(plan.candidates.size());
+  double cumulative = 0.0;
+  for (const auto& candidate : plan.candidates) {
+    cumulative += candidate.weight;
+    plan.cumulative_weights.push_back(cumulative);
+  }
+  auto frozen = std::make_shared<const PpoAssignmentPlan>(std::move(plan));
+  assignment_plan_.store(std::move(frozen), std::memory_order_release);
+  dynamic_assignments_.store(true, std::memory_order_release);
+}
+
+void PpoBatchEnv::reset_unassigned_lanes() {
+  if (!dynamic_assignments_.load(std::memory_order_acquire))
+    throw std::runtime_error("no assignment plan is active");
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    if (active_assignments_[i].metadata.plan_token == 0) reset(i);
+  });
+}
+
+PpoBatchEnv::InstalledAssignment PpoBatchEnv::sample_assignment(
+    int lane, uint64_t episode_counter) const {
+  auto plan = assignment_plan_.load(std::memory_order_acquire);
+  if (!plan || plan->candidates.empty()) return {};
+  const uint64_t lane_id = plan->lane_id_offset + static_cast<uint64_t>(lane);
+  // Lane IDs and episode counters occupy distinct hash domains.  Mixing both
+  // with the same function and XORing them makes (lane=0, episode=0) collide
+  // with (lane=1, episode=1), because equal terms cancel before the final mix.
+  const uint64_t lane_component =
+      assignment_mix(lane_id ^ 0x243f6a8885a308d3ULL);
+  const uint64_t episode_component =
+      assignment_mix(episode_counter ^ 0x13198a2e03707344ULL);
+  uint64_t random = assignment_mix(plan->plan_token ^ plan->base_seed ^
+      lane_component ^ episode_component);
+  const PpoAssignmentCandidate* selected = &plan->candidates.front();
+  if (plan->candidates.size() > 1) {
+    const double target =
+        (static_cast<double>(random >> 11) * 0x1.0p-53) * plan->total_weight;
+    const auto found = std::upper_bound(plan->cumulative_weights.begin(),
+                                        plan->cumulative_weights.end(), target);
+    const auto index = std::min<std::size_t>(
+        static_cast<std::size_t>(found - plan->cumulative_weights.begin()),
+        plan->candidates.size() - 1);
+    selected = &plan->candidates[index];
+  }
+  InstalledAssignment installed;
+  installed.entry =
+      std::shared_ptr<const PpoAssignmentEntry>(plan, &selected->entry);
+  auto& out = installed.metadata;
+  out.plan_token = plan->plan_token;
+  out.distribution_token = plan->distribution_token;
+  out.assignment_token = assignment_mix(
+      plan->plan_token ^ selected->entry.entry_token ^ lane_component ^
+      episode_component);
+  out.entry_token = selected->entry.entry_token;
+  out.provider_token = selected->entry.provider_token;
+  out.policy_token = selected->entry.policy_token;
+  out.version_token = selected->entry.version_token;
+  out.provider1_token = selected->entry.provider1_token;
+  out.policy1_token = selected->entry.policy1_token;
+  out.version1_token = selected->entry.version1_token;
+  out.deck0_token = selected->entry.deck0_token;
+  out.deck1_token = selected->entry.deck1_token;
+  out.episode_counter = episode_counter;
+  out.trainable_owner_mask = selected->entry.trainable_owner_mask;
+  out.learner_seat = static_cast<int8_t>(selected->entry.learner_seat);
+  out.fixed_actor = static_cast<int8_t>(selected->entry.fixed_actor);
+  return installed;
+}
+
+const PpoAssignmentMetadata& PpoBatchEnv::active_assignment_at(int i) const {
+  return active_assignments_.at(static_cast<std::size_t>(i)).metadata;
+}
+const PpoAssignmentMetadata& PpoBatchEnv::completed_assignment_at(int i) const {
+  return completed_assignments_.at(static_cast<std::size_t>(i));
+}
+uint64_t PpoBatchEnv::lane_episode_counter(int i) const {
+  return lane_episode_counters_.at(static_cast<std::size_t>(i));
+}
+void PpoBatchEnv::restore_lane_episode_counter(int i, uint64_t counter) {
+  lane_episode_counters_.at(static_cast<std::size_t>(i)) = counter;
+}
+const std::vector<int>& PpoBatchEnv::deck_at(int lane, int seat) const {
+  if (lane < 0 || lane >= size() || (seat != 0 && seat != 1)) {
+    throw std::out_of_range("assignment deck lane/seat out of range");
+  }
+  const auto& assignment = active_assignments_[static_cast<std::size_t>(lane)];
+  if (assignment.metadata.plan_token == 0 || assignment.entry == nullptr)
+    return seat == 0 ? deck0_ : deck1_;
+  return seat == 0 ? assignment.entry->deck0 : assignment.entry->deck1;
+}
+
+void PpoBatchEnv::update_public_card_memory(int i, int observer) {
+  if (!persistent_public_card_memory_ && !public_event_history_enabled_) return;
+  auto& by_observer = public_card_memory_[static_cast<std::size_t>(i)];
+  const int seat = std::clamp(observer, 0, 1);
+  auto& remembered = by_observer[static_cast<std::size_t>(seat)];
+  if (remembered.size() == PPO_DECK_SLOTS) return;
+  auto visible = public_zone_cards_for_observer(games_[i], seat);
+  auto& previous = public_card_snapshot_[static_cast<std::size_t>(i)]
+                                        [static_cast<std::size_t>(seat)];
+  if (visible == previous) return;
+  previous = visible;
+  std::sort(visible.begin(), visible.end());
+  if (std::includes(remembered.begin(), remembered.end(), visible.begin(),
+                    visible.end())) {
+    return;
+  }
+  SmallVec<int, 64> added;
+  std::set_difference(visible.begin(), visible.end(), remembered.begin(),
+                      remembered.end(), std::back_inserter(added));
+  const std::size_t capacity = remembered.size() >= PPO_DECK_SLOTS
+      ? 0
+      : static_cast<std::size_t>(PPO_DECK_SLOTS) - remembered.size();
+  while (added.size() > capacity) added.pop_back();
+  SmallVec<int, 64> merged = remembered;
+  for (int card : added) merged.push_back(card);
+  std::sort(merged.begin(), merged.end());
+  if (public_event_history_enabled_) {
+    for (int card : added) {
+      auto event = empty_public_event();
+      event[0] = PPO_EVENT_REVEAL_CARD;
+      event[1] = 1 - seat;
+      event[2] = 1 - seat;
+      event[3] = card;
+      event[11] = games_[i].turn;
+      public_event_history_[static_cast<std::size_t>(i)].push(event);
+    }
+  }
+  remembered = std::move(merged);
+}
+
+void PpoBatchEnv::record_public_action(int i, const Action& selected) {
+  const GameState& st = games_[i];
+  auto event = empty_public_event();
+  event[1] = st.yourIndex;
+  event[2] = st.yourIndex;
+  event[3] = selected.cardId;
+  event[5] = selected.attackId;
+  event[8] = selected.targetArea;
+  event[9] = selected.targetIndex;
+  event[11] = st.turn;
+  const Player& player = st.players[st.yourIndex];
+  const auto target_card = [&]() {
+    if (selected.targetArea == AREA_ACTIVE && player.activeKnown)
+      return player.active.id;
+    if (selected.targetArea == AREA_BENCH && selected.targetIndex >= 0 &&
+        selected.targetIndex < static_cast<int>(player.bench.size()))
+      return player.bench[static_cast<std::size_t>(selected.targetIndex)].id;
+    if (selected.targetArea == AREA_STADIUM && !st.stadium.empty())
+      return st.stadium[0];
+    return 0;
+  };
+  switch (selected.kind) {
+    case ACT_END:
+      event[0] = PPO_EVENT_END_TURN;
+      break;
+    case ACT_ATTACH:
+      event[0] = PPO_EVENT_ATTACH;
+      event[4] = target_card();
+      event[6] = AREA_HAND;
+      event[7] = selected.targetArea;
+      break;
+    case ACT_PLAY_BASIC:
+      event[0] = PPO_EVENT_PLAY_BASIC;
+      event[6] = AREA_HAND;
+      event[7] = AREA_BENCH;
+      break;
+    case ACT_PLAY_TRAINER:
+      event[0] = PPO_EVENT_PLAY_TRAINER;
+      event[6] = AREA_HAND;
+      break;
+    case ACT_EVOLVE:
+      event[0] = PPO_EVENT_EVOLVE;
+      event[4] = target_card();
+      event[6] = AREA_HAND;
+      event[7] = selected.targetArea;
+      break;
+    case ACT_ATTACK:
+      event[0] = PPO_EVENT_ATTACK;
+      event[3] = player.activeKnown ? player.active.id : 0;
+      break;
+    case ACT_RETREAT:
+      event[0] = PPO_EVENT_RETREAT;
+      event[3] = player.activeKnown ? player.active.id : 0;
+      break;
+    case ACT_ABILITY:
+      event[0] = PPO_EVENT_ABILITY;
+      event[3] = target_card();
+      break;
+    case ACT_DISCARD_INPLAY:
+      event[0] = PPO_EVENT_DISCARD_INPLAY;
+      event[3] = target_card();
+      break;
+    case ACT_SETUP_ACTIVE:
+      event[0] = PPO_EVENT_SETUP_ACTIVE;
+      event[6] = AREA_HAND;
+      event[7] = AREA_ACTIVE;
+      break;
+  }
+  if (event[0] != PPO_EVENT_PAD)
+    public_event_history_[static_cast<std::size_t>(i)].push(event);
+}
+
+void PpoBatchEnv::record_public_transition(
+    int i, int before_turn, int before_result,
+    const std::array<int, 2>& before_prizes) {
+  if (!public_event_history_enabled_) return;
+  const GameState& st = games_[i];
+  auto& history = public_event_history_[static_cast<std::size_t>(i)];
+  for (int player = 0; player < 2; ++player) {
+    const int taken = before_prizes[static_cast<std::size_t>(player)] -
+                      st.players[player].prizeCount;
+    if (taken > 0) {
+      auto event = empty_public_event();
+      event[0] = PPO_EVENT_PRIZE_TAKEN;
+      event[1] = player;
+      event[2] = player;
+      event[10] = taken;
+      event[11] = st.turn;
+      history.push(event);
+    }
+  }
+  if (st.turn != before_turn && st.result < 0) {
+    auto event = empty_public_event();
+    event[0] = PPO_EVENT_TURN_START;
+    event[1] = st.yourIndex;
+    event[2] = st.yourIndex;
+    event[11] = st.turn;
+    history.push(event);
+  }
+  if (before_result < 0 && st.result >= 0) {
+    auto event = empty_public_event();
+    event[0] = PPO_EVENT_GAME_END;
+    event[10] = st.result;
+    event[11] = st.turn;
+    history.push(event);
+  }
+}
+
+void PpoBatchEnv::step_recorded(int i, int action) {
+  if (!public_event_history_enabled_) {
+    rl_step_cached(games_[i], opts_[i], action, rngs_[i], &opts_[i]);
+    return;
+  }
+  const int before_turn = games_[i].turn;
+  const int before_result = games_[i].result;
+  const std::array<int, 2> before_prizes = {
+      games_[i].players[0].prizeCount, games_[i].players[1].prizeCount};
+  if (!opts_[i].pending && action >= 0 && action < opts_[i].n &&
+      action < static_cast<int>(opts_[i].descriptors.size())) {
+    const Action selected = descriptor_to_action(opts_[i].descriptors[action]);
+    record_public_action(i, selected);
+    apply(games_[i], selected);
+    advance_to_agent(games_[i], rngs_[i], &opts_[i]);
+  } else {
+    rl_step_cached(games_[i], opts_[i], action, rngs_[i], &opts_[i]);
+  }
+  record_public_transition(i, before_turn, before_result, before_prizes);
+}
+
 void PpoBatchEnv::reset(int i) {
+  if (public_event_history_enabled_)
+    public_event_history_[static_cast<std::size_t>(i)].clear();
+  if (persistent_public_card_memory_ || public_event_history_enabled_) {
+    auto& memory = public_card_memory_[static_cast<std::size_t>(i)];
+    memory[0].clear();
+    memory[1].clear();
+    auto& snapshot = public_card_snapshot_[static_cast<std::size_t>(i)];
+    snapshot[0].clear();
+    snapshot[1].clear();
+  }
+  if (dynamic_assignments_.load(std::memory_order_acquire)) {
+    active_assignments_[i] = sample_assignment(i, lane_episode_counters_[i]++);
+  }
   uint64_t s = rl_rand(rngs_[i]);
-  games_[i] = new_game(deck0_, deck1_, s ? s : 1);
+  const auto& assignment = active_assignments_[i];
+  const bool assigned = assignment.entry != nullptr;
+  const auto& lane_deck0 = assigned ? assignment.entry->deck0 : deck0_;
+  const auto& lane_deck1 = assigned ? assignment.entry->deck1 : deck1_;
+  games_[i] = new_game(lane_deck0, lane_deck1, s ? s : 1);
   episode_len_[i] = 0;
   advance_to_agent(games_[i], rngs_[i], &opts_[i]);
   advance_to_learner_or_done(i);
+  if (persistent_public_card_memory_ || public_event_history_enabled_) {
+    update_public_card_memory(i, 0);
+    update_public_card_memory(i, 1);
+  }
   last_prize_score_[i] =
-      static_cast<float>(prize_score(games_[i], reward_player(games_[i])));
+      static_cast<float>(prize_score(games_[i], reward_player(games_[i], i)));
 }
 
 int PpoBatchEnv::random_action(const GameState& st, uint64_t& rng) {
@@ -2180,36 +2913,64 @@ int PpoBatchEnv::opponent_action(const GameState& st, const RlOptionSet& opts,
 
 int PpoBatchEnv::opponent_action_cached(const GameState& st,
                                         const RlOptionSet& opts,
-                                        uint64_t& rng) {
-  if (opponent_mode_ == PPO_OPP_940) return native_940_action_from_options(st, opts);
-  if (opponent_mode_ == PPO_OPP_RANDOM) return opts.n > 0 ? static_cast<int>(rl_rand(rng) % opts.n) : 0;
-  return opponent_action(st, opts, rng);
+                                        uint64_t& rng, int opponent_mode,
+                                        const PpoAssignmentEntry* assignment) {
+  if (routed_opponent_action_callback_ != nullptr && assignment != nullptr) {
+    const bool seat1 = st.yourIndex == 1;
+    return routed_opponent_action_callback_(
+        routed_opponent_action_context_,
+        seat1 ? assignment->provider1_token : assignment->provider_token,
+        seat1 ? assignment->policy1_token : assignment->policy_token,
+        seat1 ? assignment->version1_token : assignment->version_token,
+        st, opts);
+  }
+  if (opponent_action_callback_ != nullptr) {
+    return opponent_action_callback_(opponent_action_context_, st, opts);
+  }
+  if (opponent_mode == PPO_OPP_940) return native_940_action_from_options(st, opts);
+  if (opponent_mode == PPO_OPP_RANDOM) return opts.n > 0 ? static_cast<int>(rl_rand(rng) % opts.n) : 0;
+  if (opponent_mode == PPO_OPP_HEURISTIC) return heuristic_action(st, opts, rng);
+  if (opponent_mode == PPO_OPP_BEAM_940)
+    return rl_meta_beam_action(st, PPO_OPP_940, 4, 6, rng);
+  return opts.n > 0 ? static_cast<int>(rl_rand(rng) % opts.n) : 0;
 }
 
 void PpoBatchEnv::advance_to_learner_or_done(int i) {
-  if (opponent_mode_ == PPO_OPP_SELF || learner_seat_ < 0) return;
-  while (games_[i].result < 0 && games_[i].yourIndex != learner_seat_ &&
+  const bool assigned = active_assignments_[i].metadata.plan_token != 0;
+  const int mode = assigned ? active_assignments_[i].entry->opponent_mode : opponent_mode_;
+  const int seat = assigned ? active_assignments_[i].metadata.learner_seat : learner_seat_;
+  if (mode == PPO_OPP_SELF || seat < 0) return;
+  while (games_[i].result < 0 && games_[i].yourIndex != seat &&
          episode_len_[i] < max_steps_) {
-    int a = opponent_action_cached(games_[i], opts_[i], rngs_[i]);
+    const PpoAssignmentEntry* entry =
+        assigned ? active_assignments_[i].entry.get() : nullptr;
+    int a = opponent_action_cached(games_[i], opts_[i], rngs_[i], mode,
+                                   entry);
     if (a < 0 || a >= opts_[i].n) a = 0;
-    rl_step_cached(games_[i], opts_[i], a, rngs_[i], &opts_[i]);
+    step_recorded(i, a);
     ++episode_len_[i];
   }
 }
 
 void PpoBatchEnv::advance_to_learner_or_done_profiled(int i,
                                                       PpoStepProfile& profile) {
-  if (opponent_mode_ == PPO_OPP_SELF || learner_seat_ < 0) return;
-  while (games_[i].result < 0 && games_[i].yourIndex != learner_seat_ &&
+  const bool assigned = active_assignments_[i].metadata.plan_token != 0;
+  const int mode = assigned ? active_assignments_[i].entry->opponent_mode : opponent_mode_;
+  const int seat = assigned ? active_assignments_[i].metadata.learner_seat : learner_seat_;
+  if (mode == PPO_OPP_SELF || seat < 0) return;
+  while (games_[i].result < 0 && games_[i].yourIndex != seat &&
          episode_len_[i] < max_steps_) {
     auto t0 = std::chrono::steady_clock::now();
-    int a = opponent_action_cached(games_[i], opts_[i], rngs_[i]);
+    const PpoAssignmentEntry* entry =
+        assigned ? active_assignments_[i].entry.get() : nullptr;
+    int a = opponent_action_cached(games_[i], opts_[i], rngs_[i], mode,
+                                   entry);
     if (a < 0 || a >= opts_[i].n) a = 0;
     auto t1 = std::chrono::steady_clock::now();
     profile.opponent_action_ns += elapsed_profile_ns(t0, t1);
 
     t0 = std::chrono::steady_clock::now();
-    rl_step_cached(games_[i], opts_[i], a, rngs_[i], &opts_[i]);
+    step_recorded(i, a);
     t1 = std::chrono::steady_clock::now();
     profile.opponent_step_ns += elapsed_profile_ns(t0, t1);
     ++episode_len_[i];
@@ -2220,9 +2981,12 @@ void PpoBatchEnv::reset_all() {
   EnvPool::instance().run(size(), threads_, [&](int i) { reset(i); });
 }
 
-int PpoBatchEnv::reward_player(const GameState& st) const {
-  if (opponent_mode_ != PPO_OPP_SELF && learner_seat_ >= 0) {
-    return learner_seat_;
+int PpoBatchEnv::reward_player(const GameState& st, int lane) const {
+  const bool assigned = active_assignments_[lane].metadata.plan_token != 0;
+  const int mode = assigned ? active_assignments_[lane].entry->opponent_mode : opponent_mode_;
+  const int seat = assigned ? active_assignments_[lane].metadata.learner_seat : learner_seat_;
+  if (mode != PPO_OPP_SELF && seat >= 0) {
+    return seat;
   }
   return st.yourIndex;
 }
@@ -2281,7 +3045,8 @@ void PpoBatchEnv::observe_ids(int32_t* in_play, int32_t* zones,
                               int32_t* global, int32_t* action_meta,
                               int32_t* action_options, int32_t* action_deck,
                               uint8_t* action_mask, int32_t* player,
-                              int32_t* result) const {
+                              int32_t* result,
+                              int32_t* known_opponent_cards, int32_t* public_events) const {
   EnvPool::instance().run(size(), threads_, [&](int i) {
     const GameState& st = games_[i];
     fill_observation_ids(
@@ -2298,7 +3063,63 @@ void PpoBatchEnv::observe_ids(int32_t* in_play, int32_t* zones,
         action_mask + i * RL_MAX_ACTIONS);
     player[i] = st.yourIndex;
     result[i] = st.result;
+    if (known_opponent_cards != nullptr && persistent_public_card_memory_) {
+      write_public_card_memory(
+          public_card_memory_[static_cast<std::size_t>(i)]
+                             [static_cast<std::size_t>(st.yourIndex)],
+          known_opponent_cards + i * PPO_DECK_SLOTS);
+    }
+    if (public_events != nullptr && public_event_history_enabled_) {
+      write_public_events(public_event_history_[static_cast<std::size_t>(i)],
+                          st.yourIndex, st.turn,
+                          public_events + i * PPO_PUBLIC_EVENT_SLOTS *
+                                              PPO_PUBLIC_EVENT_WIDTH);
+    }
   });
+}
+
+bool PpoBatchEnv::observe_ids16(
+    int16_t* in_play, int16_t* zones, int16_t* player_counts,
+    int16_t* player_status, int16_t* global, int16_t* action_meta,
+    int16_t* action_options, int16_t* action_deck, uint8_t* action_mask,
+    int32_t* player, int32_t* result,
+    int16_t* known_opponent_cards, int16_t* public_events) const {
+  std::atomic<bool> ok{true};
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    const GameState& st = games_[i];
+    bool row_ok = fill_observation_ids16(
+        st,
+        in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    row_ok = fill_action_ids16(
+                 st, action_id_view_from_options(opts_[i]),
+                 action_meta + i * ACTION_META_WIDTH,
+                 action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+                 action_deck + i * STATE_ZONE_SLOTS,
+                 action_mask + i * RL_MAX_ACTIONS) &&
+             row_ok;
+    player[i] = st.yourIndex;
+    result[i] = st.result;
+    if (known_opponent_cards != nullptr && persistent_public_card_memory_) {
+      row_ok = write_public_card_memory(
+                   public_card_memory_[static_cast<std::size_t>(i)]
+                                      [static_cast<std::size_t>(st.yourIndex)],
+                   known_opponent_cards + i * PPO_DECK_SLOTS) &&
+               row_ok;
+    }
+    if (public_events != nullptr && public_event_history_enabled_) {
+      row_ok = write_public_events(
+                   public_event_history_[static_cast<std::size_t>(i)],
+                   st.yourIndex, st.turn,
+                   public_events + i * PPO_PUBLIC_EVENT_SLOTS *
+                                       PPO_PUBLIC_EVENT_WIDTH) &&
+               row_ok;
+    }
+    if (!row_ok) ok.store(false, std::memory_order_relaxed);
+  });
+  return ok.load(std::memory_order_relaxed);
 }
 
 void PpoBatchEnv::action_features(float* out) const {
@@ -2316,8 +3137,11 @@ void PpoBatchEnv::card_features(float* out) const {
 
 void PpoBatchEnv::deck_features(float* out) const {
   for (int i = 0; i < size(); ++i) {
-    const int p = reward_player(games_[i]);
-    const std::vector<int>& deck = p == 0 ? deck0_ : deck1_;
+    const int p = reward_player(games_[i], i);
+    const auto& assignment = active_assignments_[i];
+    const std::vector<int>& deck = assignment.metadata.plan_token != 0
+        ? (p == 0 ? assignment.entry->deck0 : assignment.entry->deck1)
+        : (p == 0 ? deck0_ : deck1_);
     rl_deck_features(deck, out + i * PPO_DECK_SLOTS * PPO_CARD_FEAT_DIM);
   }
 }
@@ -2338,13 +3162,17 @@ void PpoBatchEnv::belief_summary(float* out) const {
 void PpoBatchEnv::step_rewards(const int* actions, float* reward, uint8_t* done,
                                int32_t* result, int32_t* episode_len) {
   EnvPool::instance().run(size(), threads_, [&](int i) {
-    int actor = reward_player(games_[i]);
+    int actor = reward_player(games_[i], i);
     int n = opts_[i].n;
     int action = actions[i];
     if (action < 0 || action >= n) action = 0;
-    rl_step_cached(games_[i], opts_[i], action, rngs_[i], &opts_[i]);
+    step_recorded(i, action);
     ++episode_len_[i];
     advance_to_learner_or_done(i);
+    if (persistent_public_card_memory_ || public_event_history_enabled_) {
+      update_public_card_memory(i, 0);
+      update_public_card_memory(i, 1);
+    }
 
     int r = games_[i].result;
     bool truncated = false;
@@ -2358,6 +3186,10 @@ void PpoBatchEnv::step_rewards(const int* actions, float* reward, uint8_t* done,
       done[i] = 1;
       result[i] = r;
       episode_len[i] = episode_len_[i];
+      if (dynamic_assignments_.load(std::memory_order_acquire)) {
+        active_assignments_[i].metadata.acting_seat = static_cast<int8_t>(actor);
+        completed_assignments_[i] = active_assignments_[i].metadata;
+      }
       reset(i);
     } else {
       reward[i] = transition_reward(games_[i], actor, i, false, false);
@@ -2365,7 +3197,7 @@ void PpoBatchEnv::step_rewards(const int* actions, float* reward, uint8_t* done,
       result[i] = -1;
       episode_len[i] = episode_len_[i];
       last_prize_score_[i] =
-          static_cast<float>(prize_score(games_[i], reward_player(games_[i])));
+          static_cast<float>(prize_score(games_[i], reward_player(games_[i], i)));
     }
   });
 }
@@ -2389,7 +3221,8 @@ void PpoBatchEnv::step_ids(const int* actions, float* reward, uint8_t* done,
                            int32_t* player_counts, int32_t* player_status,
                            int32_t* global, int32_t* action_meta,
                            int32_t* action_options, int32_t* action_deck,
-                           uint8_t* action_mask, int32_t* player) {
+                           uint8_t* action_mask, int32_t* player,
+                           int32_t* known_opponent_cards, int32_t* public_events) {
   step_rewards(actions, reward, done, result, episode_len);
   EnvPool::instance().run(size(), threads_, [&](int i) {
     const GameState& st = games_[i];
@@ -2406,7 +3239,64 @@ void PpoBatchEnv::step_ids(const int* actions, float* reward, uint8_t* done,
         action_deck + i * STATE_ZONE_SLOTS,
         action_mask + i * RL_MAX_ACTIONS);
     player[i] = st.yourIndex;
+    if (known_opponent_cards != nullptr && persistent_public_card_memory_) {
+      write_public_card_memory(
+          public_card_memory_[static_cast<std::size_t>(i)]
+                             [static_cast<std::size_t>(st.yourIndex)],
+          known_opponent_cards + i * PPO_DECK_SLOTS);
+    }
+    if (public_events != nullptr && public_event_history_enabled_) {
+      write_public_events(public_event_history_[static_cast<std::size_t>(i)],
+                          st.yourIndex, st.turn,
+                          public_events + i * PPO_PUBLIC_EVENT_SLOTS *
+                                              PPO_PUBLIC_EVENT_WIDTH);
+    }
   });
+}
+
+bool PpoBatchEnv::step_ids16(
+    const int* actions, float* reward, uint8_t* done, int32_t* result,
+    int32_t* episode_len, int16_t* in_play, int16_t* zones,
+    int16_t* player_counts, int16_t* player_status, int16_t* global,
+    int16_t* action_meta, int16_t* action_options, int16_t* action_deck,
+    uint8_t* action_mask, int32_t* player,
+    int16_t* known_opponent_cards, int16_t* public_events) {
+  step_rewards(actions, reward, done, result, episode_len);
+  std::atomic<bool> ok{true};
+  EnvPool::instance().run(size(), threads_, [&](int i) {
+    const GameState& st = games_[i];
+    bool row_ok = fill_observation_ids16(
+        st,
+        in_play + i * 2 * STATE_INPLAY_SLOTS * STATE_INPLAY_WIDTH,
+        zones + i * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+        player_counts + i * 2 * 5, player_status + i * 2 * 5,
+        global + i * STATE_GLOBAL_WIDTH);
+    row_ok = fill_action_ids16(
+                 st, action_id_view_from_options(opts_[i]),
+                 action_meta + i * ACTION_META_WIDTH,
+                 action_options + i * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
+                 action_deck + i * STATE_ZONE_SLOTS,
+                 action_mask + i * RL_MAX_ACTIONS) &&
+             row_ok;
+    player[i] = st.yourIndex;
+    if (known_opponent_cards != nullptr && persistent_public_card_memory_) {
+      row_ok = write_public_card_memory(
+                   public_card_memory_[static_cast<std::size_t>(i)]
+                                      [static_cast<std::size_t>(st.yourIndex)],
+                   known_opponent_cards + i * PPO_DECK_SLOTS) &&
+               row_ok;
+    }
+    if (public_events != nullptr && public_event_history_enabled_) {
+      row_ok = write_public_events(
+                   public_event_history_[static_cast<std::size_t>(i)],
+                   st.yourIndex, st.turn,
+                   public_events + i * PPO_PUBLIC_EVENT_SLOTS *
+                                       PPO_PUBLIC_EVENT_WIDTH) &&
+               row_ok;
+    }
+    if (!row_ok) ok.store(false, std::memory_order_relaxed);
+  });
+  return ok.load(std::memory_order_relaxed);
 }
 
 void PpoBatchEnv::step_card_features(const int* actions, float* obs,
@@ -2417,14 +3307,18 @@ void PpoBatchEnv::step_card_features(const int* actions, float* obs,
                                      float* card_features) {
   int D = RL_OBS_DIM;
   EnvPool::instance().run(size(), threads_, [&](int i) {
-    int actor = reward_player(games_[i]);
+    int actor = reward_player(games_[i], i);
     int n = opts_[i].n;
     int action = actions[i];
     if (action < 0 || action >= n) action = 0;
-    rl_step_cached(games_[i], opts_[i], action, rngs_[i], &opts_[i]);
+    step_recorded(i, action);
     ++episode_len_[i];
     advance_to_learner_or_done(i);
 
+    if (persistent_public_card_memory_ || public_event_history_enabled_) {
+      update_public_card_memory(i, 0);
+      update_public_card_memory(i, 1);
+    }
     int r = games_[i].result;
     bool truncated = false;
     if (r < 0 && episode_len_[i] >= max_steps_) {
@@ -2444,7 +3338,7 @@ void PpoBatchEnv::step_card_features(const int* actions, float* obs,
       result[i] = -1;
       episode_len[i] = episode_len_[i];
       last_prize_score_[i] =
-          static_cast<float>(prize_score(games_[i], reward_player(games_[i])));
+          static_cast<float>(prize_score(games_[i], reward_player(games_[i], i)));
     }
 
     rl_encode_obs(games_[i], obs + i * D);
@@ -2487,7 +3381,7 @@ PpoStepProfile PpoBatchEnv::profile_step_card_features(const int* actions,
   auto t_total = std::chrono::steady_clock::now();
   for (int rep = 0; rep < profile.repeats; ++rep) {
     for (int i = 0; i < n_envs; ++i) {
-      int actor = reward_player(games_[i]);
+      int actor = reward_player(games_[i], i);
 
       auto t0 = std::chrono::steady_clock::now();
       int n = opts_[i].n;
@@ -2533,7 +3427,7 @@ PpoStepProfile PpoBatchEnv::profile_step_card_features(const int* actions,
         ep_len[i] = episode_len_[i];
         profile.opponent_steps += std::max(0, episode_len_[i] - len_before - 1);
         last_prize_score_[i] =
-            static_cast<float>(prize_score(games_[i], reward_player(games_[i])));
+            static_cast<float>(prize_score(games_[i], reward_player(games_[i], i)));
       }
       t1 = std::chrono::steady_clock::now();
       profile.reward_reset_ns += elapsed_profile_ns(t0, t1);

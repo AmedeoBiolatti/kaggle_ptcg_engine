@@ -42,6 +42,13 @@ if(PTCG_ENGINE_BUILD_TESTS)
   add_executable(test_id_tensors tests/test_id_tensors.cpp)
   target_link_libraries(test_id_tensors PRIVATE ptcg_core)
   add_test(NAME test_id_tensors COMMAND test_id_tensors)
+  add_executable(test_hidden_zone_memory tests/test_hidden_zone_memory.cpp)
+  target_link_libraries(test_hidden_zone_memory PRIVATE ptcg_core)
+  add_test(NAME test_hidden_zone_memory_smoke
+           COMMAND test_hidden_zone_memory --steps 8192)
+  add_executable(test_attack_damage_history tests/test_attack_damage_history.cpp)
+  target_link_libraries(test_attack_damage_history PRIVATE ptcg_core)
+  add_test(NAME test_attack_damage_history COMMAND test_attack_damage_history)
 endif()
 
 # --- Python binding -------------------------------------------------------

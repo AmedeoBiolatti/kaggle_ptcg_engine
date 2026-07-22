@@ -1,5 +1,9 @@
 #pragma once
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 #include "ptcg/state.hpp"
@@ -16,6 +20,45 @@ constexpr int PPO_ACTION_FEAT_DIM = 128;
 constexpr int PPO_CARD_SLOTS = 64;
 constexpr int PPO_CARD_FEAT_DIM = 80;
 constexpr int PPO_DECK_SLOTS = 60;
+constexpr int PPO_PUBLIC_EVENT_SLOTS = 32;
+constexpr int PPO_PUBLIC_EVENT_WIDTH = 12;
+
+enum PpoPublicEventType {
+  PPO_EVENT_PAD = 0,
+  PPO_EVENT_TURN_START = 1,
+  PPO_EVENT_END_TURN = 2,
+  PPO_EVENT_ATTACH = 3,
+  PPO_EVENT_PLAY_BASIC = 4,
+  PPO_EVENT_PLAY_TRAINER = 5,
+  PPO_EVENT_EVOLVE = 6,
+  PPO_EVENT_ATTACK = 7,
+  PPO_EVENT_RETREAT = 8,
+  PPO_EVENT_ABILITY = 9,
+  PPO_EVENT_DISCARD_INPLAY = 10,
+  PPO_EVENT_SETUP_ACTIVE = 11,
+  PPO_EVENT_REVEAL_CARD = 12,
+  PPO_EVENT_PRIZE_TAKEN = 13,
+  PPO_EVENT_GAME_END = 14,
+};
+
+struct PpoPublicEventRing {
+  std::array<std::array<int, PPO_PUBLIC_EVENT_WIDTH>,
+             PPO_PUBLIC_EVENT_SLOTS> events{};
+  int begin = 0;
+  int size = 0;
+
+  void clear() { begin = 0; size = 0; }
+  void push(const std::array<int, PPO_PUBLIC_EVENT_WIDTH>& event) {
+    int slot = (begin + size) % PPO_PUBLIC_EVENT_SLOTS;
+    if (size == PPO_PUBLIC_EVENT_SLOTS) {
+      slot = begin;
+      begin = (begin + 1) % PPO_PUBLIC_EVENT_SLOTS;
+    } else {
+      ++size;
+    }
+    events[static_cast<std::size_t>(slot)] = event;
+  }
+};
 constexpr int PPO_BELIEF_SLOTS = 40;
 constexpr int PPO_BELIEF_SUMMARY_DIM = 52;
 constexpr int PPO_OPP_SELF = 0;
@@ -109,6 +152,13 @@ MctsResult rl_value_mcts(const GameState& root_state, int n_sims, uint64_t seed,
 // True when `st` is at a genuine agent decision (>=2 options, single-select).
 bool rl_is_agent_decision(const GameState& st);
 
+// Sample only `perspective`'s own unknown Deck/Prize partition from their
+// submitted decklist. The opponent remains an oracle concrete state. Sampling
+// uses an independent seed and must not advance GameState::rng.
+GameState rl_determinize_own_hidden(const GameState& state,
+                                    const std::vector<int>& decklist,
+                                    int perspective, uint64_t seed);
+
 // --- vectorized batch environment -----------------------------------------
 // N independent self-play games sharing one decklist pairing. One policy controls
 // the player to move in every game (self-play); reward is from that mover's POV.
@@ -165,6 +215,12 @@ class VectorEnv {
                    int32_t* action_meta, int32_t* action_options,
                    int32_t* action_deck, uint8_t* action_mask,
                    int32_t* player, int32_t* result) const;
+  bool observe_ids16(int16_t* in_play, int16_t* zones,
+                     int16_t* player_counts, int16_t* player_status,
+                     int16_t* global, int16_t* action_meta,
+                     int16_t* action_options, int16_t* action_deck,
+                     uint8_t* action_mask, int32_t* player,
+                     int32_t* result) const;
   void step(const int* actions, float* obs, float* reward, uint8_t* done,
             uint8_t* mask, int32_t* player, int32_t* result);
   void step_ids(const int* actions, float* reward, uint8_t* done,
@@ -173,11 +229,18 @@ class VectorEnv {
                 int32_t* global, int32_t* action_meta,
                 int32_t* action_options, int32_t* action_deck,
                 uint8_t* action_mask, int32_t* player, int32_t* result);
+  bool step_ids16(const int* actions, float* reward, uint8_t* done,
+                  int16_t* in_play, int16_t* zones,
+                  int16_t* player_counts, int16_t* player_status,
+                  int16_t* global, int16_t* action_meta,
+                  int16_t* action_options, int16_t* action_deck,
+                  uint8_t* action_mask, int32_t* player, int32_t* result);
   const GameState& state_at(int i) const { return games_[i]; }
   const RlOptionSet& options_at(int i) const { return opts_[i]; }
 
  private:
   void reset(int i);
+  void step_one(int i, int action, float& reward, uint8_t& done);
   std::vector<GameState> games_;
   std::vector<RlOptionSet> opts_;
   std::vector<uint64_t> rngs_;  // one independent stream per game
@@ -185,13 +248,111 @@ class VectorEnv {
   int threads_ = 0;
 };
 
+struct PpoAssignmentEntry {
+  uint64_t entry_token = 0;
+  uint64_t provider_token = 0;
+  uint64_t policy_token = 0;
+  uint64_t version_token = 0;
+  uint64_t provider1_token = 0;
+  uint64_t policy1_token = 0;
+  uint64_t version1_token = 0;
+  uint64_t deck0_token = 0;
+  uint64_t deck1_token = 0;
+  uint64_t role_token = 0;
+  uint8_t trainable_owner_mask = 0;
+  int fixed_actor = -1;
+  int learner_seat = -1;
+  int opponent_mode = PPO_OPP_SELF;
+  std::vector<int> deck0;
+  std::vector<int> deck1;
+};
+
+struct PpoAssignmentCandidate {
+  PpoAssignmentEntry entry;
+  double weight = 1.0;
+};
+
+struct PpoAssignmentPlan {
+  uint64_t plan_token = 0;
+  uint64_t distribution_token = 0;
+  uint64_t base_seed = 1;
+  uint64_t lane_id_offset = 0;
+  std::vector<PpoAssignmentCandidate> candidates;
+  // Cold-path sampling index populated before immutable publication.
+  double total_weight = 0.0;
+  std::vector<double> cumulative_weights;
+};
+
+struct PpoAssignmentMetadata {
+  uint64_t plan_token = 0;
+  uint64_t distribution_token = 0;
+  uint64_t assignment_token = 0;
+  uint64_t entry_token = 0;
+  uint64_t provider_token = 0;
+  uint64_t policy_token = 0;
+  uint64_t version_token = 0;
+  uint64_t provider1_token = 0;
+  uint64_t policy1_token = 0;
+  uint64_t version1_token = 0;
+  uint64_t deck0_token = 0;
+  uint64_t deck1_token = 0;
+  uint64_t episode_counter = 0;
+  uint8_t trainable_owner_mask = 0;
+  int8_t acting_seat = -1;
+  int8_t learner_seat = -1;
+  int8_t fixed_actor = -1;
+};
+
 class PpoBatchEnv {
  public:
+  using OpponentActionCallback = int (*)(
+      void* context, const GameState& state, const RlOptionSet& options);
+  using RoutedOpponentActionCallback = int (*)(
+      void* context, uint64_t provider_token, uint64_t policy_token,
+      uint64_t version_token, const GameState& state,
+      const RlOptionSet& options);
+
   PpoBatchEnv(std::vector<int> deck0, std::vector<int> deck1, int n,
               uint64_t seed, int max_steps = 2000, double prize_weight = 0.0,
               int learner_seat = -1, int opponent_mode = PPO_OPP_SELF,
-              int reward_mode = PPO_REWARD_TERMINAL, int threads = 0);
+              int reward_mode = PPO_REWARD_TERMINAL, int threads = 0,
+              bool persistent_public_card_memory = false,
+              bool public_event_history = false);
   int size() const { return static_cast<int>(games_.size()); }
+  // A published immutable plan is observed only by later lane resets. Existing
+  // games retain the assignment captured when they started. Publication
+  // validates native structural deck legality (size, catalog membership,
+  // printed-name copies, ACE SPEC count, and a Basic Pokemon). CardInfo has no
+  // implementation-status or set/rotation metadata, so those ruleset checks
+  // remain the upstream Python catalog/publisher's responsibility.
+  void publish_assignment_plan(PpoAssignmentPlan plan);
+  void reset_unassigned_lanes();
+  bool dynamic_assignments() const {
+    return dynamic_assignments_.load(std::memory_order_acquire);
+  }
+  const PpoAssignmentMetadata& active_assignment_at(int i) const;
+  const PpoAssignmentMetadata& completed_assignment_at(int i) const;
+  uint64_t lane_episode_counter(int i) const;
+  void restore_lane_episode_counter(int i, uint64_t counter);
+  const std::vector<int>& deck_at(int lane, int seat) const;
+
+  // Install an optional zero-allocation opponent policy owned by the caller.
+  // The context must outlive this environment. This keeps the engine generic:
+  // downstream runtimes can compose domain-specific fixed policies without
+  // adding those policies as dependencies of ptcg_core.
+  void set_opponent_action_callback(void* context,
+                                    OpponentActionCallback callback) {
+    opponent_action_context_ = context;
+    opponent_action_callback_ = callback;
+  }
+  // Route-aware counterpart used by immutable assignment plans.  The callback
+  // receives the exact route for the seat currently taking the fixed-policy
+  // action.  The legacy callback remains available for static environments.
+  void set_routed_opponent_action_callback(
+      void* context, RoutedOpponentActionCallback callback) {
+    routed_opponent_action_context_ = context;
+    routed_opponent_action_callback_ = callback;
+  }
 
   void reset_all();
   void observe(float* obs, uint8_t* mask, int32_t* player) const;
@@ -199,7 +360,17 @@ class PpoBatchEnv {
                    int32_t* player_status, int32_t* global,
                    int32_t* action_meta, int32_t* action_options,
                    int32_t* action_deck, uint8_t* action_mask,
-                   int32_t* player, int32_t* result) const;
+                   int32_t* player, int32_t* result,
+                   int32_t* known_opponent_cards = nullptr,
+                   int32_t* public_events = nullptr) const;
+  bool observe_ids16(int16_t* in_play, int16_t* zones,
+                     int16_t* player_counts, int16_t* player_status,
+                     int16_t* global, int16_t* action_meta,
+                     int16_t* action_options, int16_t* action_deck,
+                     uint8_t* action_mask, int32_t* player,
+                     int32_t* result,
+                     int16_t* known_opponent_cards = nullptr,
+                     int16_t* public_events = nullptr) const;
   void action_features(float* out) const;
   void card_features(float* out) const;
   void deck_features(float* out) const;
@@ -221,20 +392,42 @@ class PpoBatchEnv {
                 int32_t* player_status, int32_t* global,
                 int32_t* action_meta, int32_t* action_options,
                 int32_t* action_deck, uint8_t* action_mask,
-                int32_t* player);
+                int32_t* player,
+                int32_t* known_opponent_cards = nullptr,
+                int32_t* public_events = nullptr);
+  bool step_ids16(const int* actions, float* reward, uint8_t* done,
+                  int32_t* result, int32_t* episode_len, int16_t* in_play,
+                  int16_t* zones, int16_t* player_counts,
+                  int16_t* player_status, int16_t* global,
+                  int16_t* action_meta, int16_t* action_options,
+                  int16_t* action_deck, uint8_t* action_mask,
+                  int32_t* player,
+                  int16_t* known_opponent_cards = nullptr,
+                  int16_t* public_events = nullptr);
 
  private:
+  struct InstalledAssignment {
+    PpoAssignmentMetadata metadata;
+    std::shared_ptr<const PpoAssignmentEntry> entry;
+  };
   void reset(int i);
+  void update_public_card_memory(int i, int observer);
+  void record_public_action(int i, const Action& selected);
+  void record_public_transition(int i, int before_turn, int before_result,
+                                const std::array<int, 2>& before_prizes);
+  void step_recorded(int i, int action);
+  InstalledAssignment sample_assignment(int i, uint64_t episode_counter) const;
   void advance_to_learner_or_done(int i);
   void advance_to_learner_or_done_profiled(int i, PpoStepProfile& profile);
   int opponent_action(const GameState& st, const RlOptionSet& opts,
                       uint64_t& rng);
   int opponent_action_cached(const GameState& st, const RlOptionSet& opts,
-                             uint64_t& rng);
+                             uint64_t& rng, int opponent_mode,
+                             const PpoAssignmentEntry* assignment);
   int random_action(const GameState& st, uint64_t& rng);
   int heuristic_action(const GameState& st, const RlOptionSet& opts,
                        uint64_t rng);
-  int reward_player(const GameState& st) const;
+  int reward_player(const GameState& st, int lane) const;
   double prize_score(const GameState& st, int player) const;
   float terminal_reward(const GameState& st, int player) const;
   float transition_reward(const GameState& st, int player, int i,
@@ -247,12 +440,26 @@ class PpoBatchEnv {
   std::vector<int> deck0_, deck1_;
   std::vector<int> episode_len_;
   std::vector<float> last_prize_score_;
+  std::vector<std::array<SmallVec<int, 64>, 2>> public_card_memory_;
+  std::vector<std::array<SmallVec<int, 64>, 2>> public_card_snapshot_;
+  bool persistent_public_card_memory_ = false;
+  std::vector<PpoPublicEventRing> public_event_history_;
+  bool public_event_history_enabled_ = false;
+  std::atomic<std::shared_ptr<const PpoAssignmentPlan>> assignment_plan_{nullptr};
+  std::vector<InstalledAssignment> active_assignments_;
+  std::vector<PpoAssignmentMetadata> completed_assignments_;
+  std::vector<uint64_t> lane_episode_counters_;
+  std::atomic<bool> dynamic_assignments_{false};
   int threads_ = 0;
   int max_steps_ = 2000;
   double prize_weight_ = 0.0;
   int learner_seat_ = -1;
   int opponent_mode_ = PPO_OPP_SELF;
   int reward_mode_ = PPO_REWARD_TERMINAL;
+  void* opponent_action_context_ = nullptr;
+  OpponentActionCallback opponent_action_callback_ = nullptr;
+  void* routed_opponent_action_context_ = nullptr;
+  RoutedOpponentActionCallback routed_opponent_action_callback_ = nullptr;
 };
 
 // --- native random self-play actor (throughput / data generation) ----------

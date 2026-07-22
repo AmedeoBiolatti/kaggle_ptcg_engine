@@ -86,21 +86,30 @@ struct Player {
   int deckCount = 0;
   int handCount = 0;
   int prizeCount = 0;
-  bool handKnown = false;  // hand identities visible (own player)
+  bool handKnown = false;  // engine carries exact hand identities
+  bool handPublicKnown = false;  // complete hand is visible to the opponent
   bool deckKnown = false;  // deck identities are known; order may change on shuffle
   bool prizesKnown = false;  // remaining Prize identities are known
+  // Owner-only deductions established after legally inspecting the complete
+  // remaining deck. Observation encoders must not expose these from the
+  // opponent POV.
+  bool ownDeckInspected = false;
+  bool ownPrizesInferred = false;
   // All card-id zone lists share one type so zone-pointer dispatch stays
   // uniform (deck is the sizing bound; the others are just as cheap inline).
   SmallVec<int, 64> hand;   // card ids (iff handKnown)
   SmallVec<int, 64> discard;
   SmallVec<int, 64> deck;   // ordered deck (free-running; empty in replay mode)
-  SmallVec<int, 64> prizes;  // prize cards (free-running; counts-only in replay)
+  SmallVec<int, 8> prizes;  // at most 6 Prize cards in supported play
   SmallVec<bool, 64> deckKnownMask;    // per-slot known card identity in deck
-  SmallVec<bool, 64> prizesKnownMask;  // per-slot known card identity in prizes
-  SmallVec<int, 64> handKnownCards;   // unordered known hidden hand membership
-  SmallVec<int, 64> deckKnownCards;   // unordered known deck membership
-  SmallVec<int, 64> prizesKnownCards;  // unordered known Prize membership
-  SmallVec<bool, 64> prizeFaceUp;  // true iff a Prize is revealed for rest of game
+  SmallVec<bool, 8> prizesKnownMask;  // per-slot known card identity in prizes
+  SmallVec<int, 8> handKnownCards;   // unordered known hidden hand membership
+  SmallVec<int, 8> deckKnownCards;   // unordered known deck membership
+  SmallVec<int, 8> prizesKnownCards;  // unordered known Prize membership
+  // Exact owner-known membership in the union of Deck and Prizes when an
+  // effect has hidden the partition between the two zones.
+  SmallVec<int, 64> deckPrizeKnownCards;
+  SmallVec<bool, 8> prizeFaceUp;  // true iff a Prize is revealed for rest of game
   bool poisoned = false, burned = false, asleep = false, paralyzed = false,
        confused = false;
   int poisonDamageCounters = 1;  // Checkup poison damage, normally 1 counter.
@@ -344,6 +353,11 @@ std::vector<Descriptor> legal_main(const GameState& st);
 // `collectLogs` opts the state into native-log emission from the deal onward.
 GameState new_game(const std::vector<int>& deck0, const std::vector<int>& deck1,
                    uint64_t seed, bool collectLogs = false);
+
+// Record the legal-information event produced by a full own-deck inspection.
+// Free-running states can then identify the remaining Prize multiset exactly;
+// count-only/replay states fail closed and retain unknown Prize identities.
+void mark_full_deck_inspected(Player& player);
 
 // --- transitions ----------------------------------------------------------
 

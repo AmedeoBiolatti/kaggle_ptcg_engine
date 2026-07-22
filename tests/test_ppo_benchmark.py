@@ -94,6 +94,116 @@ class PpoBenchmarkTest(unittest.TestCase):
             self.assertEqual(player2.shape, (env.size(),))
             self.assertEqual(result2.shape, (env.size(),))
 
+    def test_vector_env_explicit_thread_counts_are_deterministic(self) -> None:
+        try:
+            import ptcg_engine as E
+        except ImportError as exc:
+            raise unittest.SkipTest(f"native extension missing: {exc}") from exc
+
+        serial = E.VectorEnv(MEGA_LUCARIO, MEGA_LUCARIO, 256, 17, 1)
+        parallel = E.VectorEnv(MEGA_LUCARIO, MEGA_LUCARIO, 256, 17, 4)
+        for _ in range(8):
+            serial_step = serial.step(np.zeros(256, dtype=np.int32))
+            parallel_step = parallel.step(np.zeros(256, dtype=np.int32))
+            (
+                serial_state,
+                serial_reward,
+                serial_done,
+                serial_action,
+                serial_player,
+                serial_result,
+            ) = serial_step
+            (
+                parallel_state,
+                parallel_reward,
+                parallel_done,
+                parallel_action,
+                parallel_player,
+                parallel_result,
+            ) = parallel_step
+            for key in serial_state:
+                if isinstance(serial_state[key], np.ndarray):
+                    np.testing.assert_array_equal(serial_state[key], parallel_state[key])
+            for key in serial_action:
+                if isinstance(serial_action[key], np.ndarray):
+                    np.testing.assert_array_equal(serial_action[key], parallel_action[key])
+            np.testing.assert_array_equal(serial_reward, parallel_reward)
+            np.testing.assert_array_equal(serial_done, parallel_done)
+            np.testing.assert_array_equal(serial_player, parallel_player)
+            np.testing.assert_array_equal(serial_result, parallel_result)
+
+    def test_vector_env_int16_ids_are_lossless_and_half_sized(self) -> None:
+        try:
+            import ptcg_engine as E
+        except ImportError as exc:
+            raise unittest.SkipTest(f"native extension missing: {exc}") from exc
+
+        full_env = E.VectorEnv(MEGA_LUCARIO, MEGA_LUCARIO, 16, 23, 1)
+        compact_env = E.VectorEnv(MEGA_LUCARIO, MEGA_LUCARIO, 16, 23, 1)
+        full_state, full_action, full_player, full_result = full_env.observe_ids()
+        compact_state, compact_action, compact_player, compact_result = (
+            compact_env.observe_ids16()
+        )
+
+        for key in ("in_play", "zones", "player_counts", "player_status", "global",
+                    "select_meta", "select_deck"):
+            self.assertEqual(compact_state[key].dtype, np.int16)
+            np.testing.assert_array_equal(compact_state[key], full_state[key])
+            self.assertEqual(compact_state[key].nbytes * 2, full_state[key].nbytes)
+        for key in ("meta", "deck"):
+            self.assertEqual(compact_action[key].dtype, np.int16)
+            np.testing.assert_array_equal(compact_action[key], full_action[key])
+
+        compact_options = compact_action["options"].astype(np.int32)
+        reconstructed_refs = compact_options[..., 18] + (
+            compact_options[..., 19] << int(compact_action["raw_ref_shift"])
+        )
+        np.testing.assert_array_equal(reconstructed_refs, full_action["options"][..., 18])
+        for column in list(range(18)) + list(range(20, E.ACTION_OPTION_WIDTH)):
+            np.testing.assert_array_equal(
+                compact_options[..., column], full_action["options"][..., column]
+            )
+        np.testing.assert_array_equal(compact_action["mask"], full_action["mask"])
+        np.testing.assert_array_equal(compact_player, full_player)
+        np.testing.assert_array_equal(compact_result, full_result)
+
+        actions = np.zeros(16, dtype=np.int32)
+        full_step = full_env.step(actions)
+        compact_step = compact_env.step16(actions)
+        for key in ("in_play", "zones", "player_counts", "player_status", "global"):
+            np.testing.assert_array_equal(compact_step[0][key], full_step[0][key])
+        np.testing.assert_array_equal(compact_step[1], full_step[1])
+        np.testing.assert_array_equal(compact_step[2], full_step[2])
+        np.testing.assert_array_equal(compact_step[4], full_step[4])
+        np.testing.assert_array_equal(compact_step[5], full_step[5])
+
+        into_env = E.VectorEnv(MEGA_LUCARIO, MEGA_LUCARIO, 16, 23, 1)
+        into_state, into_action, into_player, into_result = (
+            into_env.observe_ids16()
+        )
+        reward = np.empty(16, dtype=np.float32)
+        done = np.empty(16, dtype=np.uint8)
+        state_ptr = into_state["in_play"].__array_interface__["data"][0]
+        option_ptr = into_action["options"].__array_interface__["data"][0]
+        returned = into_env.step16_into(
+            actions, into_state, into_action, reward, done,
+            into_player, into_result
+        )
+        self.assertIsNone(returned)
+        self.assertEqual(
+            state_ptr, into_state["in_play"].__array_interface__["data"][0]
+        )
+        self.assertEqual(
+            option_ptr, into_action["options"].__array_interface__["data"][0]
+        )
+        for key in ("in_play", "zones", "player_counts", "player_status", "global"):
+            np.testing.assert_array_equal(into_state[key], compact_step[0][key])
+        np.testing.assert_array_equal(reward, compact_step[1])
+        np.testing.assert_array_equal(done, compact_step[2])
+        np.testing.assert_array_equal(into_action["mask"], compact_step[3]["mask"])
+        np.testing.assert_array_equal(into_player, compact_step[4])
+        np.testing.assert_array_equal(into_result, compact_step[5])
+
     def test_float_feature_env_methods_are_deprecated(self) -> None:
         try:
             import ptcg_engine as E

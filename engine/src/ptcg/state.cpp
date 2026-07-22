@@ -4,8 +4,8 @@
 #include <cctype>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_set>
@@ -146,20 +146,27 @@ static StateSnap snapshot_state(const GameState& st) {
 }
 
 template <typename Before, typename After>
-static std::vector<int> multiset_added(const Before& before,
+static SmallVec<int, 64> multiset_added(const Before& before,
                                        const After& after) {
-  std::vector<int> out;
-  std::map<int, int> count;
-  for (int id : before) count[id] -= 1;
-  for (int id : after) count[id] += 1;
-  for (auto [id, n] : count)
-    for (int i = 0; i < n; ++i)
-      if (id > 0) out.push_back(id);
+  SmallVec<int, 64> remaining;
+  SmallVec<int, 64> out;
+  for (int id : before)
+    if (id > 0) remaining.push_back(id);
+  std::sort(remaining.begin(), remaining.end());
+  for (int id : after) {
+    if (id <= 0) continue;
+    auto it = std::lower_bound(remaining.begin(), remaining.end(), id);
+    if (it != remaining.end() && *it == id)
+      remaining.erase(it);
+    else
+      out.push_back(id);
+  }
+  std::sort(out.begin(), out.end());
   return out;
 }
 
 template <typename Before, typename After>
-static std::vector<int> multiset_removed(const Before& before,
+static SmallVec<int, 64> multiset_removed(const Before& before,
                                          const After& after) {
   return multiset_added(after, before);
 }
@@ -176,31 +183,31 @@ static bool has_log_type_card_since(const GameState& st, size_t start,
 }
 
 static void emit_hp_delta(GameState& st, const InPlaySnap& before,
-                          const InPlaySnap& after, int owner,
+                          const InPlay* after, int owner,
                           bool putDamageCounter = false) {
-  if (!before.present || !after.present || before.id != after.id ||
-      before.hp == after.hp)
+  if (!before.present || !after || before.id != after->id ||
+      before.hp == after->hp)
     return;
   NativeLog log;
   log.type = 16;
   log.playerIndex = owner;
-  log.cardId = after.id;
-  log.value = after.hp - before.hp;
+  log.cardId = after->id;
+  log.value = after->hp - before.hp;
   log.putDamageCounter = putDamageCounter;
   emit_log(st, log);
 }
 
 static void emit_inplay_attachment_deltas(GameState& st, const InPlaySnap& before,
-                                          const InPlaySnap& after, int owner,
+                                          const InPlay* after, int owner,
                                           int area) {
-  if (!after.present) return;
-  for (int id : multiset_added(before.energyCards, after.energyCards))
+  if (!after) return;
+  for (int id : multiset_added(before.energyCards, after->energyCardIds))
     emit_move_log(st, owner, id, AREA_DISCARD, area);
-  for (int id : multiset_removed(before.energyCards, after.energyCards))
+  for (int id : multiset_removed(before.energyCards, after->energyCardIds))
     emit_move_log(st, owner, id, area, AREA_DISCARD);
-  for (int id : multiset_added(before.tools, after.tools))
+  for (int id : multiset_added(before.tools, after->tools))
     emit_move_log(st, owner, id, AREA_HAND, area);
-  for (int id : multiset_removed(before.tools, after.tools))
+  for (int id : multiset_removed(before.tools, after->tools))
     emit_move_log(st, owner, id, area, AREA_DISCARD);
 }
 
@@ -216,7 +223,7 @@ static void emit_condition_delta(GameState& st, bool before, bool after,
 }
 
 static void emit_player_delta_logs(GameState& st, const PlayerSnap& before,
-                                   const PlayerSnap& after, int player,
+                                   const Player& after, int player,
                                    size_t logStart) {
   for (int id : multiset_added(before.hand, after.hand)) {
     bool drew = after.deckCount < before.deckCount;
@@ -225,7 +232,7 @@ static void emit_player_delta_logs(GameState& st, const PlayerSnap& before,
   }
   for (int id : multiset_added(before.discard, after.discard)) {
     int from = AREA_HAND;
-    std::vector<int> removedDeck = multiset_removed(before.deck, after.deck);
+    auto removedDeck = multiset_removed(before.deck, after.deck);
     if (std::find(removedDeck.begin(), removedDeck.end(), id) != removedDeck.end())
       from = AREA_DECK;
     emit_move_log(st, player, id, from, AREA_DISCARD);
@@ -235,15 +242,17 @@ static void emit_player_delta_logs(GameState& st, const PlayerSnap& before,
   for (int id : multiset_removed(before.prizes, after.prizes))
     emit_move_log(st, player, id, AREA_PRIZE, AREA_HAND);
 
-  emit_hp_delta(st, before.active, after.active, player);
-  emit_inplay_attachment_deltas(st, before.active, after.active, player, AREA_ACTIVE);
+  const InPlay* afterActive = after.activeKnown ? &after.active : nullptr;
+  emit_hp_delta(st, before.active, afterActive, player);
+  emit_inplay_attachment_deltas(st, before.active, afterActive, player,
+                                AREA_ACTIVE);
   const size_t nBench = std::min(before.bench.size(), after.bench.size());
   for (size_t i = 0; i < nBench; ++i) {
-    emit_hp_delta(st, before.bench[i], after.bench[i], player);
-    emit_inplay_attachment_deltas(st, before.bench[i], after.bench[i], player,
+    emit_hp_delta(st, before.bench[i], &after.bench[i], player);
+    emit_inplay_attachment_deltas(st, before.bench[i], &after.bench[i], player,
                                   AREA_BENCH);
   }
-  if (after.active.present) {
+  if (after.activeKnown) {
     emit_condition_delta(st, before.poisoned, after.poisoned, 17, player,
                          after.active.id);
     emit_condition_delta(st, before.burned, after.burned, 18, player,
@@ -259,12 +268,11 @@ static void emit_player_delta_logs(GameState& st, const PlayerSnap& before,
 
 static void emit_deep_delta_logs(GameState& st, const StateSnap& before,
                                  size_t logStart) {
-  StateSnap after = snapshot_state(st);
   for (int p = 0; p < 2; ++p)
-    emit_player_delta_logs(st, before.players[p], after.players[p], p, logStart);
-  for (int id : multiset_added(before.stadium, after.stadium))
+    emit_player_delta_logs(st, before.players[p], st.players[p], p, logStart);
+  for (int id : multiset_added(before.stadium, st.stadium))
     emit_move_log(st, st.yourIndex, id, AREA_HAND, AREA_STADIUM);
-  for (int id : multiset_removed(before.stadium, after.stadium))
+  for (int id : multiset_removed(before.stadium, st.stadium))
     emit_move_log(st, 1 - st.yourIndex, id, AREA_STADIUM, AREA_DISCARD);
 }
 
@@ -298,6 +306,39 @@ static bool consume_known_card(KnownList& known, int cid) {
   return true;
 }
 
+static void refresh_deck_prize_union(Player& p) {
+  if (p.deckPrizeKnownCards.empty()) return;
+  if (static_cast<int>(p.deck.size()) != p.deckCount ||
+      static_cast<int>(p.prizes.size()) != p.prizeCount)
+    return;
+  p.deckPrizeKnownCards.clear();
+  for (int id : p.deck) p.deckPrizeKnownCards.push_back(id);
+  for (int id : p.prizes) p.deckPrizeKnownCards.push_back(id);
+  std::sort(p.deckPrizeKnownCards.begin(), p.deckPrizeKnownCards.end());
+}
+
+static void cap_deck_membership_to_unknown_positions(Player& p) {
+  if (static_cast<int>(p.deck.size()) != p.deckCount) return;
+  for (std::size_t index = 0; index < p.deckKnownCards.size();) {
+    const int card = p.deckKnownCards[index];
+    const int available = static_cast<int>(
+        std::count(p.deck.begin(), p.deck.end(), card));
+    int fixed = 0;
+    const std::size_t slots =
+        std::min(p.deck.size(), p.deckKnownMask.size());
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+      if (p.deckKnownMask[slot] && p.deck[slot] == card) ++fixed;
+    }
+    const int accepted = static_cast<int>(std::count(
+        p.deckKnownCards.begin(), p.deckKnownCards.begin() + index, card));
+    if (fixed + accepted >= available) {
+      p.deckKnownCards.erase(p.deckKnownCards.begin() + index);
+    } else {
+      ++index;
+    }
+  }
+}
+
 static void normalize_deck_knowledge(Player& p) {
   if (static_cast<int>(p.deck.size()) != p.deckCount) {
     p.deckKnown = false;
@@ -314,6 +355,14 @@ static void normalize_deck_knowledge(Player& p) {
       p.deckKnown = false;
       break;
     }
+  // Exact positional knowledge already names every remaining deck card.
+  // Retaining unordered membership as well represents the same physical
+  // copies twice and makes a later shuffle append duplicates.
+  if (p.deckKnown)
+    p.deckKnownCards.clear();
+  else
+    cap_deck_membership_to_unknown_positions(p);
+  refresh_deck_prize_union(p);
 }
 
 static void mark_deck_known(Player& p) {
@@ -324,8 +373,30 @@ static void mark_deck_known(Player& p) {
   }
 }
 
+void mark_full_deck_inspected(Player& p) {
+  mark_deck_known(p);
+  if (!p.deckKnown) return;
+  p.ownDeckInspected = true;
+
+  // A player knows their submitted decklist and every non-Prize card that is
+  // outside the deck. Once the complete remaining deck has been inspected,
+  // the remaining Prize multiset is therefore a deterministic deduction.
+  // Only materialize it when the engine carries every exact identity.
+  if (static_cast<int>(p.prizes.size()) != p.prizeCount ||
+      !std::all_of(p.prizes.begin(), p.prizes.end(),
+                   [](int card_id) { return card_id > 0; })) {
+    return;
+  }
+  p.ownPrizesInferred = true;
+  p.deckPrizeKnownCards.clear();
+  for (int id : p.deck) p.deckPrizeKnownCards.push_back(id);
+  for (int id : p.prizes) p.deckPrizeKnownCards.push_back(id);
+  std::sort(p.deckPrizeKnownCards.begin(), p.deckPrizeKnownCards.end());
+}
+
 static void shuffle_deck_known(Player& p, uint64_t& rng) {
   if (p.deckKnown) {
+    p.deckKnownCards.clear();
     for (int cid : p.deck) add_known_card(p.deckKnownCards, cid);
   } else if (p.deckKnownMask.size() == p.deck.size()) {
     for (size_t i = 0; i < p.deck.size(); ++i)
@@ -334,6 +405,7 @@ static void shuffle_deck_known(Player& p, uint64_t& rng) {
   shuffle_deck(p.deck, rng);
   p.deckKnownMask.clear();
   p.deckKnown = false;
+  cap_deck_membership_to_unknown_positions(p);
 }
 
 static bool deck_card_known_at(const Player& p, int idx) {
@@ -507,6 +579,11 @@ static int draw_n(GameState& st, Player& p, int n) {
   int side = (&p == &st.players[0]) ? 0 : ((&p == &st.players[1]) ? 1 : -1);
   for (int i = 0; i < n; ++i) {
     if (p.deckCount <= 0) break;
+    if (p.handPublicKnown) {
+      p.handKnownCards.clear();
+      for (int id : p.hand) add_known_card(p.handKnownCards, id);
+      p.handPublicKnown = false;
+    }
     p.deckCount -= 1;
     p.handCount += 1;
     ++drawn;
@@ -603,6 +680,11 @@ static void remove_hand_card(GameState& st, Player& p, int cardId) {
     auto it = std::find(p.hand.begin(), p.hand.end(), cardId);
     if (it != p.hand.end()) p.hand.erase(it);
   }
+  // handKnownCards is observer knowledge, independent of whether the engine
+  // carries the owner's exact raw hand. A publicly known card that leaves the
+  // hand must consume exactly one unordered membership entry; otherwise the
+  // same physical copy is counted again in its public destination zone.
+  consume_known_card(p.handKnownCards, cardId);
   p.handCount -= 1;
 }
 
@@ -1692,6 +1774,21 @@ static bool owner_has_active_ability_card(const GameState& st, int ownerSide,
       return true;
   return false;
 }
+static int active_ability_count_id(const GameState& st, int ownerSide,
+                                   int cardId) {
+  if (ownerSide < 0 || ownerSide >= 2) return 0;
+  const Player& p = st.players[ownerSide];
+  int count = 0;
+  if (p.activeKnown && p.active.id == cardId &&
+      pokemon_has_active_ability(st, ownerSide, p.active, true))
+    ++count;
+  for (const auto& b : p.bench)
+    if (b.id == cardId &&
+        pokemon_has_active_ability(st, ownerSide, b, false))
+      ++count;
+  return count;
+}
+
 
 static bool relicanth_memory_available(const GameState& st, int ownerSide) {
   const Player& p = st.players[ownerSide];
@@ -1994,11 +2091,17 @@ static bool attack_effects_prevented(const GameState& st, int targetSide,
   if (st.effectStack.empty()) return false;
   const EffectFrame& fr = st.effectStack.back();
   if (targetSide == fr.a) return false;
+  const Player& targetOwner = st.players[targetSide];
+  const bool targetIsActive =
+      targetOwner.activeKnown && &target == &targetOwner.active;
+  const bool targetAbilityActive =
+      !ability_suppressed(st, targetSide, target, targetIsActive);
   const CardInfo* src = fr.sourceCardId > 0 ? find_card(fr.sourceCardId) : nullptr;
   if (src && (src->cardType == ITEM || src->cardType == SUPPORTER) &&
-      (target.id == 424 || target.id == 994))
+      (target.id == 424 || target.id == 994) && targetAbilityActive)
     return true;  // Cetitan ex / Fraxure: opponent Item or Supporter effects.
-  if (src && src->cardType == POKEMON && fr.attackId == 0 && target.id == 1040)
+  if (src && src->cardType == POKEMON && fr.attackId == 0 &&
+      target.id == 1040 && targetAbilityActive)
     return true;  // Mega Clefable ex: opponent Pokemon Ability effects.
   if (fr.attackId > 0) {
     if (target.preventEffectsTurn == st.turn) {
@@ -2014,8 +2117,12 @@ static bool attack_effects_prevented(const GameState& st, int targetSide,
                                         *attackerInPlay, fr.a, 0)))
         return true;
     }
-    if (target.id == 203 || target.id == 835 || target.id == 1136)
+    if ((target.id == 203 || target.id == 835 || target.id == 1136) &&
+        targetAbilityActive)
       return true;  // Unaware / Emperor's Stance / Protective Cover
+    if (!targetIsActive && (target.id == 28 || target.id == 362) &&
+        targetAbilityActive)
+      return true;  // Storehouse Hideaway / So Submerged: damage and effects.
     if (std::find(target.energyCardIds.begin(), target.energyCardIds.end(), 11) !=
         target.energyCardIds.end())
       return true;  // Mist Energy
@@ -2023,13 +2130,12 @@ static bool attack_effects_prevented(const GameState& st, int targetSide,
             target.energyCardIds.end() &&
         pokemon_has_type(target.id, FIGHTING))
       return true;  // Rock Fighting Energy
-    const Player& owner = st.players[targetSide];
     const CardInfo* tc = find_card(target.id);
-    if (in_play_has(owner, 414) && tc && tc->basic &&
+    if (owner_has_active_ability_card(st, targetSide, 414) && tc && tc->basic &&
         name_contains(tc->name, "Team Rocket"))
       return true;  // Team Rocket's Articuno: Basic Team Rocket's Pokemon
   } else if (src && target.id == 1151) {
-    if (src && src->cardType == SUPPORTER)
+    if (src->cardType == SUPPORTER && targetAbilityActive)
       return true;  // Antique Sail Fossil: opponent Supporter effects
   }
   return false;
@@ -2121,19 +2227,24 @@ static bool passive_damage_prevented(const GameState& st,
   const Player& owner = st.players[defenderSide];
   const CardInfo* attacker = find_card(attackerInPlay.id);
   const CardInfo* defenderCard = find_card(defender.id);
+  const bool defenderIsActive =
+      owner.activeKnown && &defender == &owner.active;
+  const bool defenderAbilityActive =
+      !ability_suppressed(st, defenderSide, defender, defenderIsActive);
+
 
   // Self/active-style prevention abilities.
-  if (defender.id == 83)  // Farigiraf ex: Basic Pokemon ex
+  if (defender.id == 83 && defenderAbilityActive)  // Farigiraf ex
     return attacker && attacker->basic && (attacker->ex || attacker->megaEx);
-  if (defender.id == 117)  // Cornerstone Mask Ogerpon ex: Pokemon with Ability
+  if (defender.id == 117 && defenderAbilityActive)  // Cornerstone Mask Ogerpon ex
     return pokemon_has_active_ability(st, 1 - defenderSide, attackerInPlay, true);
-  if (defender.id == 158)  // Drednaw: damage >= 200
+  if (defender.id == 158 && defenderAbilityActive)  // Drednaw
     return damage >= 200;
-  if (defender.id == 207)  // Milotic ex: Tera Pokemon
+  if (defender.id == 207 && defenderAbilityActive)  // Milotic ex
     return attacker && attacker->tera;
-  if (defender.id == 330 || defender.id == 345)  // Safeguard / Mysterious Rock Inn
+  if ((defender.id == 330 || defender.id == 345) && defenderAbilityActive)
     return attacker && (attacker->ex || attacker->megaEx);
-  if (defender.id == 504)  // Carracosta: attacker has any Special Energy attached
+  if (defender.id == 504 && defenderAbilityActive)
     return has_special_energy(attackerInPlay);
 
   // Bench protection abilities. These prevent attack damage to Benched Pokemon;
@@ -2141,11 +2252,12 @@ static bool passive_damage_prevented(const GameState& st,
   if (defenderBench && defenderCard && defenderCard->tera)
     return true;
   if (defenderBench && (defender.id == 28 || defender.id == 362 ||
-                        defender.id == 979 || defender.id == 1138))
+                        defender.id == 1138) && defenderAbilityActive)
     return true;
-  if (defenderBench && in_play_has(owner, 74))  // Rabsca: all your Benched Pokemon
+  if (defenderBench && owner_has_active_ability_card(st, defenderSide, 74))
     return true;
-  if (defenderBench && in_play_has(owner, 343) && !has_rule_box(defenderCard))
+  if (defenderBench && owner_has_active_ability_card(st, defenderSide, 343) &&
+      !has_rule_box(defenderCard))
     return true;  // Shaymin: Benched Pokemon without a Rule Box
 
   return false;
@@ -2163,7 +2275,8 @@ static int passive_damage_reduction(GameState& st,
   if ((defender.id == 383 || defender.id == 631 || defender.id == 766) &&
       !ability_suppressed(st, defenderSide, defender, defenderIsActive))
     reduce += 30;  // Mud Coat / Bouffer / Diamond Coat
-  if (defender.id == 799 && attacker &&
+  if (defender.id == 799 &&
+      !ability_suppressed(st, defenderSide, defender, defenderIsActive) && attacker &&
       (attacker->energyType == FIRE || attacker->energyType == WATER))
     reduce += 30;  // Dewgong: {R}/{W} attackers
   if (active_tool(st, defender, 1177) &&
@@ -2179,11 +2292,13 @@ static int passive_damage_reduction(GameState& st,
   if (damage > 0 && active_tool(st, defender, 1170) && attacker &&
       attacker->energyType == DRAGON && discard_tool(owner, defender, 1170))
     reduce += 60;  // Haban Berry
-  if (in_play_has(owner, 1033) && has_energy_type(defender, WATER))
+  if (owner_has_active_ability_card(st, defenderSide, 1033) &&
+      has_energy_type(defender, WATER))
     reduce += 50;  // Aurorus: your Pokemon with {W} Energy
   if (has_energy_type(defender, METAL))
-    reduce += 20 * in_play_count_id(owner, 623);  // Klinklang: your Pokemon with {M} Energy
-  if (bench_has(owner, 637) && defenderCard &&
+    reduce += 20 * active_ability_count_id(st, defenderSide, 623);
+  if (bench_has(owner, 637) && owner_has_active_ability_card(st, defenderSide, 637) &&
+      defenderCard &&
       name_contains(defenderCard->name, "Steven"))
     reduce += 30;  // Steven's Carbink on Bench: Steven's Pokemon
   if (cur_stadium(st) == 1258 && defenderCard &&
@@ -2192,7 +2307,8 @@ static int passive_damage_reduction(GameState& st,
   if (st.teamReduceTurn[defenderSide] == st.turn && defenderCard &&
       defenderCard->energyType == st.teamReduceType[defenderSide])
     reduce += st.teamReduceAmount[defenderSide];
-  if (in_play_has(owner, 175) && in_play_name_count(owner, "Bouffalant") >= 2 &&
+  if (owner_has_active_ability_card(st, defenderSide, 175) &&
+      in_play_name_count(owner, "Bouffalant") >= 2 &&
       defenderCard && defenderCard->basic && defenderCard->energyType == COLORLESS)
     reduce += 60;  // Curly Wall; does not stack, so apply once.
 
@@ -2242,31 +2358,35 @@ static int passive_attack_damage_delta(const GameState& st, int attackerSide,
   const CardInfo* defenderCard = find_card(defender.id);
   if (!attacker || !defenderCard) return 0;
   int delta = 0;
+  const bool attackerAbilityActive =
+      !ability_suppressed(st, attackerSide, attackerInPlay, true);
 
-  if (attackerInPlay.id == 116 && has_energy_type(attackerInPlay, DARKNESS))
+  if (attackerInPlay.id == 116 && attackerAbilityActive &&
+      has_energy_type(attackerInPlay, DARKNESS))
     delta += 100;  // Okidogi: any {D} Energy attached
-  if (in_play_has(owner, 155) && (defenderCard->stage1 || defenderCard->stage2))
+  if (owner_has_active_ability_card(st, attackerSide, 155) &&
+      (defenderCard->stage1 || defenderCard->stage2))
     delta += 30;   // Carracosta: opponent Active Evolution Pokemon
   if (attacker->energyType == FIRE && (attacker->stage1 || attacker->stage2))
-    delta += 10 * in_play_count_id(owner, 202);  // Victini: Evolution {R} Pokemon
-  if (in_play_has(owner, 304) && name_contains(attacker->name, "Hop"))
+    delta += 10 * active_ability_count_id(st, attackerSide, 202);
+  if (owner_has_active_ability_card(st, attackerSide, 304) && name_contains(attacker->name, "Hop"))
     delta += 30;   // Hop's Snorlax: your Hop's Pokemon
-  if (in_play_has(owner, 322) &&
+  if (owner_has_active_ability_card(st, attackerSide, 322) &&
       (attacker->energyType == GRASS || attacker->energyType == FIRE))
-    delta += 20 * in_play_count_id(owner, 322);  // Lilligant: your {G}/{R} Pokemon
-  if (attackerInPlay.id == 126 && defenderActive &&
+    delta += 20 * active_ability_count_id(st, attackerSide, 322);
+  if (attackerInPlay.id == 126 && attackerAbilityActive && defenderActive &&
       pokemon_has_active_ability(st, 1 - attackerSide, defender, true))
     delta += 50;   // Galvantula: into opponent Active Pokemon with an Ability
-  if (in_play_has(owner, 342) && name_contains(attacker->name, "Cynthia"))
+  if (owner_has_active_ability_card(st, attackerSide, 342) && name_contains(attacker->name, "Cynthia"))
     delta += 30;   // Cynthia's Roserade: your Cynthia's Pokemon
   if (defenderActive)
-    delta += 20 * in_play_count_id(owner, 481);  // Serperior ex: Regal Cheer
-  if (attackerInPlay.id == 439 &&
+    delta += 20 * active_ability_count_id(st, attackerSide, 481);
+  if (attackerInPlay.id == 439 && attackerAbilityActive &&
       (attackerInPlay.maxHp - attackerInPlay.hp) / 10 >= 2)
     delta += 120;  // Annihilape: this Pokemon has 2+ damage counters
   if (attacker->energyType == FIGHTING)
-    delta += 30 * in_play_count_id(owner, 685);  // Garganacl: your {F} Pokemon
-  if (attackerInPlay.id == 829 && in_play_has_dark_mega_ex(owner))
+    delta += 30 * active_ability_count_id(st, attackerSide, 685);
+  if (attackerInPlay.id == 829 && attackerAbilityActive && in_play_has_dark_mega_ex(owner))
     delta += 120;  // Seviper: you have any {D} Mega Evolution Pokemon ex
   if (active_tool(st, attackerInPlay, 1158) &&
       (defenderCard->ex || defenderCard->megaEx))
@@ -2286,7 +2406,8 @@ static int passive_attack_damage_delta(const GameState& st, int attackerSide,
   if (cur_stadium(st) == 1255 && name_contains(attacker->name, "Hop") &&
       defenderActive)
     delta += 30;   // Postwick: Hop's Pokemon
-  if (defenderActive && defenderOwner.activeKnown && defenderOwner.active.id == 716)
+  if (defenderActive && defenderOwner.activeKnown && defenderOwner.active.id == 716 &&
+      pokemon_has_active_ability(st, 1 - attackerSide, defenderOwner.active, true))
     delta -= 30;   // Pyroar: opponent Active's attacks do 30 less damage
 
   return delta;
@@ -2303,7 +2424,11 @@ static int apply_defender_attack_damage_mods(GameState& st,
                                defender, defenderBench, dmg)) {
     return 0;
   }
-  if (defender.id == 970 && dmg > 0 && has_energy_type(defender, DARKNESS) &&
+  bool defenderIsActive = st.players[defenderSide].activeKnown &&
+                          &defender == &st.players[defenderSide].active;
+  if (defender.id == 970 &&
+      !ability_suppressed(st, defenderSide, defender, defenderIsActive) &&
+      dmg > 0 && has_energy_type(defender, DARKNESS) &&
       flip_heads(st))
     return 0;  // Fezandipiti: prevent attack damage on heads with {D} Energy.
   if (defender.dmgReduceTurn == st.turn && dmg > 0)
@@ -2313,6 +2438,7 @@ static int apply_defender_attack_damage_mods(GameState& st,
   if (passiveReduce > 0 && dmg > 0)
     dmg = dmg > passiveReduce ? dmg - passiveReduce : 0;
   if ((defender.id == 210 || defender.id == 533) &&
+      !ability_suppressed(st, defenderSide, defender, defenderIsActive) &&
       defender.hp == defender.maxHp && dmg >= defender.hp)
     dmg = std::max(0, defender.hp - 10);  // Resolute Heart / Sturdy
   if (defender.takeMoreDamageTurn == st.turn && dmg > 0)
@@ -2995,10 +3121,6 @@ static bool start_on_attach_trigger_order(GameState& st, int actor,
   return true;
 }
 
-static bool palafin_ex_in_deck(const Player& p) {
-  return std::find(p.deck.begin(), p.deck.end(), 107) != p.deck.end();
-}
-
 static void set_palafin_yesno_pending(GameState& st, EffectFrame& fr) {
   (void)fr;
   PendingDecision pd;
@@ -3016,7 +3138,9 @@ static void queue_palafin_zero_to_hero(GameState& st, int owner, int benchIdx,
   if (benchIdx < 0 || benchIdx >= static_cast<int>(p.bench.size())) return;
   if (p.bench[benchIdx].id != 106 || p.bench[benchIdx].abilityUsedThisTurn)
     return;
-  if (!palafin_ex_in_deck(p)) return;
+  // Whether Palafin ex is actually in the hidden deck is learned only after
+  // choosing to use the Ability and searching. It must not change the
+  // pre-reveal YES/NO action set.
   EffectFrame ef;
   ef.effect = EFF_PALAFIN_ZERO_TO_HERO;
   ef.a = owner;
@@ -3064,7 +3188,7 @@ static void queue_move_triggers(GameState& st, int owner, int activeToBenchIdx,
 
 static void set_palafin_deck_pending_or_finish(GameState& st, EffectFrame& fr) {
   Player& me = st.players[fr.a];
-  mark_deck_known(me);
+  mark_full_deck_inspected(me);
   PendingDecision pd;
   pd.context = 7;  // TO_HAND/deck-search style choice.
   pd.minCount = 1;
@@ -3303,7 +3427,7 @@ static void evolve_in_place_from_deck(GameState& st, int actor, int deckIdx,
 
 static void set_grand_tree_stage1_pending(GameState& st, EffectFrame& fr) {
   Player& me = st.players[fr.a];
-  mark_deck_known(me);
+  mark_full_deck_inspected(me);
   PendingDecision pd;
   pd.context = 7;  // TO_HAND/deck-search style choice.
   pd.minCount = 1;
@@ -3333,7 +3457,7 @@ static void set_grand_tree_stage1_pending(GameState& st, EffectFrame& fr) {
 static void set_grand_tree_stage2_pending_or_finish(GameState& st,
                                                     EffectFrame& fr) {
   Player& me = st.players[fr.a];
-  mark_deck_known(me);
+  mark_full_deck_inspected(me);
   InPlay* target = inplay_ref(me, fr.selfBench);
   PendingDecision pd;
   pd.context = 7;
@@ -3679,9 +3803,9 @@ static void set_bother_bot_prize_pending(GameState& st, EffectFrame& fr) {
   for (int i = 0; i < opp.prizeCount; ++i) {
     if (i < static_cast<int>(opp.prizeFaceUp.size()) && opp.prizeFaceUp[i])
       continue;
-    Atom card = (i < static_cast<int>(opp.prizes.size()))
-                    ? Atom::I(opp.prizes[i])
-                    : Atom::N();
+    // The physical slot is selectable, but its face-down identity is not
+    // public and must never enter a cached action descriptor.
+    Atom card = Atom::N();
     pd.options.push_back({Atom::S("CARD"), Atom::S("PRIZE"),
                           Atom::I(i), card});
   }
@@ -3932,8 +4056,16 @@ static void clear_attack_effects_for_evolve(InPlay& p) {
   p.attackCostModTurn = -1;
   p.retreatCostMod = 0;
   p.retreatCostModTurn = -1;
+  p.delayedDamageTurn = -1;
+  p.delayedDamageCounters = 0;
+  p.delayedKoTurn = -1;
+  p.delayedKoPromoteBeforePrize = false;
   p.preventDmgTurn = -1;
+  p.preventDmgCond = 0;
+  p.preventDmgValue = 0;
   p.preventEffectsTurn = -1;
+  p.preventEffectsCond = 0;
+  p.preventEffectsValue = 0;
   p.attackFlipFailTurn = -1;
   p.noWeaknessTurn = -1;
   p.takeMoreDamageTurn = -1;
@@ -3942,10 +4074,21 @@ static void clear_attack_effects_for_evolve(InPlay& p) {
   p.nextAttackBonusTurn = -1;
   p.nextAttackBonus = 0;
   p.nextAttackSetBase = -1;
+  p.damagedByAttackCountersTurn = -1;
+  p.damagedByAttackCounters = 0;
+  p.damagedByAttackStatus = -1;
+  p.damagedByAttackEqualCountersTurn = -1;
   p.damagedByAttackTurn = -1;
   p.damagedByAttackSide = -1;
   p.damagedByAttackAmount = 0;
   p.damagedByAttackBeforeHp = -1;
+  p.energyAttachCountersTurn = -1;
+  p.energyAttachCounters = 0;
+  p.energyAttachCountersFromHandOnly = 0;
+  p.attackDmgReduce = 0;
+  p.attackDmgReduceTurn = -1;
+  p.attackBonus = 0;
+  p.attackBonusTurn = -1;
 }
 
 static void clear_status_for_evolve(GameState& st, int side, bool activeSpot,
@@ -4164,7 +4307,7 @@ static bool set_attach_basic_energy_each_target_pending(GameState& st,
                           : (source == AZ_DISCARD) ? me.discard
                                                    : me.deck;
   if (source == AZ_DECK)
-    mark_deck_known(me);
+    mark_full_deck_inspected(me);
   const char* label = (source == AZ_HAND)      ? "HAND"
                       : (source == AZ_DISCARD) ? "DISCARD"
                                                : "DECK";
@@ -4794,18 +4937,12 @@ static void build_choose(GameState& st, const Op& o) {
     Player& src = st.players[1 - fr.a];
     if (static_cast<int>(src.hand.size()) == src.handCount)
       src.handKnown = true;
-    const char* label = "HAND";
-    if (fr.sourceCardId == 542 && pd.context == CTX_TO_BENCH)
-      label = "LOOKING";
-    else if ((fr.attackId == 995 || fr.attackId == 1371) &&
-             pd.context == CTX_DISCARD)
-      label = "DECK";
     for (int i = 0; i < static_cast<int>(src.hand.size()); ++i)
       if (matches_filter(src.hand[i], filter))
-        pd.options.push_back({Atom::S("CARD"), Atom::S(label), Atom::I(i),
+        pd.options.push_back({Atom::S("CARD"), Atom::S("HAND"), Atom::I(i),
                               Atom::I(src.hand[i])});
   } else if (zone == Z_DECK || zone == Z_DECK_BOTTOM7) {
-    if (zone == Z_DECK) mark_deck_known(me);
+    if (zone == Z_DECK) mark_full_deck_inspected(me);
     int n = (zone == Z_DECK_BOTTOM7) ? std::min(7, static_cast<int>(me.deck.size()))
                                      : static_cast<int>(me.deck.size());
     if (fr.attackId == 740 && zone == Z_DECK &&
@@ -4837,7 +4974,7 @@ static void build_choose(GameState& st, const Op& o) {
     SmallVec<int, 64>& src = (zone == Z_HAND_ENERGY)      ? me.hand
                             : (zone == Z_DISCARD_ENERGY) ? me.discard
                                                          : me.deck;
-    if (zone == Z_DECK_ENERGY) mark_deck_known(me);
+    if (zone == Z_DECK_ENERGY) mark_full_deck_inspected(me);
     const char* label = (zone == Z_HAND_ENERGY)      ? "HAND"
                         : (zone == Z_DISCARD_ENERGY) ? "DISCARD"
                                                      : "DECK";
@@ -5053,7 +5190,7 @@ static void build_choose_top_deck(GameState& st, const Op& o) {
   int rawCount = (o.p0 < 0) ? -o.p0 : o.p0;
   int n = std::min(rawCount, static_cast<int>(owner.deck.size()));
   if (n == owner.deckCount && static_cast<int>(owner.deck.size()) == owner.deckCount)
-    mark_deck_known(owner);
+    mark_full_deck_inspected(owner);
   bool sameWindow = fr.topDeckCount > 0 && fr.topDeckOwner == ownerIndex;
   if (!sameWindow) {
     int countedOut = std::min(n, std::max(0, owner.deckCount));
@@ -5061,12 +5198,16 @@ static void build_choose_top_deck(GameState& st, const Op& o) {
     fr.topDeckCountedOut = countedOut;
   }
   int start = static_cast<int>(owner.deck.size()) - n;
-  if (n > 0 && static_cast<int>(owner.deck.size()) == owner.deckCount) {
+  if (n > 0 && static_cast<int>(owner.deck.size()) ==
+                   owner.deckCount + fr.topDeckCountedOut) {
     if (owner.deckKnownMask.size() < owner.deck.size())
       owner.deckKnownMask.resize(owner.deck.size(), false);
     for (int i = start; i < static_cast<int>(owner.deck.size()); ++i)
       owner.deckKnownMask[i] = true;
-    normalize_deck_knowledge(owner);
+    // deckCount temporarily excludes the revealed window. Normalizing here
+    // would treat that intentional mismatch as replay uncertainty and erase
+    // the positions we just learned; normalization happens when the window is
+    // closed and deckCount is restored.
   }
   std::vector<int> exclude;
   if (fr.savedPhase == Z_DECK && fr.topDeckOwner == ownerIndex)
@@ -5798,6 +5939,9 @@ void run_program(GameState& st, const std::vector<int>& tape) {
         return;
       }
       case OP_CRISPIN_CHOOSE_ENERGIES: {
+        // The option list enumerates every Basic Energy in the remaining
+        // deck, so the player has legally inspected the complete deck.
+        mark_full_deck_inspected(me);
         PendingDecision pd;
         pd.context = o.p0;
         pd.minCount = 0;
@@ -6699,9 +6843,7 @@ void run_program(GameState& st, const std::vector<int>& tape) {
         for (int i = 0; i < opp.prizeCount; ++i) {
           if (i < static_cast<int>(opp.prizeFaceUp.size()) && opp.prizeFaceUp[i])
             continue;
-          Atom card = (i < static_cast<int>(opp.prizes.size()))
-                          ? Atom::I(opp.prizes[i])
-                          : Atom::N();
+          Atom card = Atom::N();
           pd.options.push_back({Atom::S("CARD"), Atom::S("PRIZE"),
                                 Atom::I(i), card});
         }
@@ -6723,21 +6865,12 @@ void run_program(GameState& st, const std::vector<int>& tape) {
           break;
         }
         if (!me.prizes.empty()) {
-          std::vector<int> oldPrizes = me.prizes;
-          std::vector<bool> oldKnown(oldPrizes.size(), me.prizesKnown);
-          if (me.prizesKnownMask.size() >= oldPrizes.size()) {
-            for (size_t i = 0; i < oldPrizes.size(); ++i)
-              oldKnown[i] = oldKnown[i] || me.prizesKnownMask[i];
-          }
-          shuffle_deck(oldPrizes, st.rng);
-          for (int id : oldPrizes) push_deck_bottom(me, id, false);
-          for (size_t i = 0; i < me.prizes.size(); ++i) {
-            bool knownPrize = i < oldKnown.size() && oldKnown[i];
-            if (knownPrize) add_known_card(me.deckKnownCards, me.prizes[i]);
-          }
+          for (int id : me.prizes) push_deck_bottom(me, id, false);
+          // Ticket shuffles the former Prizes into the whole deck before
+          // dealing a new face-down Prize set.
+          shuffle_deck(me.deck, st.rng);
         } else {
           me.deckCount += n;
-          me.deckKnown = false;
         }
         me.prizes.clear();
         me.prizeFaceUp.clear();
@@ -6745,25 +6878,31 @@ void run_program(GameState& st, const std::vector<int>& tape) {
         me.prizesKnownCards.clear();
         me.prizeCount = 0;
         me.prizesKnown = false;
-        int take = std::min(n, static_cast<int>(me.deck.size()));
-        PendingDecision pd;
-        pd.context = 11; // CTX_TO_PRIZE
-        pd.minCount = take;
-        pd.maxCount = take;
-        for (int i = 0; i < take; ++i) {
-          int cardId = erase_deck_at(me, static_cast<int>(me.deck.size()) - 1);
-          fr.savedScratch.push_back(cardId);
-          pd.options.push_back({Atom::S("CARD"), Atom::S("DECK"),
-                                Atom::I(i), Atom::I(cardId)});
+
+        const int take = std::min(n, me.deckCount);
+        const int represented =
+            std::min(take, static_cast<int>(me.deck.size()));
+        for (int i = 0; i < represented; ++i) {
+          const int card_id =
+              erase_deck_at(me, static_cast<int>(me.deck.size()) - 1);
+          me.prizes.push_back(card_id);
+          me.prizeFaceUp.push_back(false);
+          me.prizesKnownMask.push_back(false);
         }
-        st.pending = pd;
-        if (take <= 0) {
-          st.pending = PendingDecision();
-          st.lastEffectCount = 0;
-          fr.pc += 1;
-          break;
-        }
-        return;
+        me.deckCount -= take - represented;
+        me.prizeCount = take;
+
+        // The new partition between deck and Prizes is hidden. Previous exact
+        // knowledge applies only to their union, so both zones fail closed.
+        me.deckKnown = false;
+        me.deckKnownMask.clear();
+        me.deckKnownCards.clear();
+        me.ownDeckInspected = false;
+        me.ownPrizesInferred = false;
+        refresh_deck_prize_union(me);
+        st.lastEffectCount = take;
+        fr.pc += 1;
+        break;
       }
       case OP_SHUFFLE_HAND_INTO_DECK: {
         Player& who = (o.p0 == S_OPP) ? st.players[1 - fr.a] : me;
@@ -7728,7 +7867,10 @@ void run_program(GameState& st, const std::vector<int>& tape) {
       }
       case OP_REVEAL_HAND: {
         Player& who = (o.p0 == S_OPP) ? st.players[1 - fr.a] : me;
-        if (static_cast<int>(who.hand.size()) == who.handCount) who.handKnown = true;
+        if (static_cast<int>(who.hand.size()) == who.handCount) {
+          who.handKnown = true;
+          who.handPublicKnown = true;
+        }
         st.lastEffectCount = who.handCount;
         fr.pc += 1;
         break;
@@ -10370,8 +10512,12 @@ static void clear_attack_end_turn_flags(GameState& st) {
   clear_appear_this_turn_flags(st);
 }
 
-static void clear_attack_damage_markers(GameState& st) {
-  auto clear_one = [](InPlay& p) {
+static void clear_stale_attack_damage_markers(GameState& st) {
+  auto clear_one = [&st](InPlay& p) {
+    // Effects such as Juggernaut Horn may inspect damage taken during the
+    // opponent's immediately preceding turn. Keep that one-turn history, but
+    // remove it before it can leak into a later turn.
+    if (p.damagedByAttackTurn >= st.turn - 1) return;
     p.damagedByAttackTurn = -1;
     p.damagedByAttackSide = -1;
     p.damagedByAttackAmount = 0;
@@ -10393,6 +10539,7 @@ static void start_turn(GameState& st, int player) {
   emit_log(st, start);
   clear_pending_ko_auras(st);
   st.turn += 1;
+  clear_stale_attack_damage_markers(st);
   st.turnActionCount = 1;  // turn-start draw counts as the first action
   st.supporterPlayed = st.stadiumPlayed = st.energyAttached = st.retreated = false;
   st.teamRocketSupporterPlayed = false;
@@ -10834,7 +10981,7 @@ static bool set_amulet_hope_pending(GameState& st, int owner, int taker,
   Player& p = st.players[owner];
   if (p.deckCount <= 0) return false;
   if (static_cast<int>(p.deck.size()) == p.deckCount)
-    mark_deck_known(p);
+    mark_full_deck_inspected(p);
   PendingDecision pd;
   pd.context = 7;  // TO_HAND
   pd.minCount = 1;
@@ -11307,17 +11454,17 @@ static void set_promote_pending(GameState& st, int who) {
   st.pending = pd;
 }
 
-// After ALL Checkup prizes are taken, decide the outcome. A player wins by taking
-// their last Prize OR if the opponent has no Pokemon left to promote; when BOTH
-// hold at once (simultaneous double-KO) the game is a tie (result 2). Returns
-// true (ending the resolution) iff the game is over.
+// After ALL Checkup prizes are taken, score both win conditions independently.
+// A player satisfying both conditions beats an opponent satisfying only one;
+// equal positive scores are a draw in the competition API.
+// Returns true iff the game is over.
 static bool checkup_endgame(GameState& st) {
   bool aOut = !st.players[0].activeKnown && st.players[0].bench.empty();
   bool bOut = !st.players[1].activeKnown && st.players[1].bench.empty();
-  bool aWins = st.players[0].prizeCount == 0 || bOut;
-  bool bWins = st.players[1].prizeCount == 0 || aOut;
-  if (!aWins && !bWins) return false;
-  set_result(st, (aWins && bWins) ? 2 : (aWins ? 0 : 1));  // 2 = tie
+  int aScore = (st.players[0].prizeCount == 0 ? 1 : 0) + (bOut ? 1 : 0);
+  int bScore = (st.players[1].prizeCount == 0 ? 1 : 0) + (aOut ? 1 : 0);
+  if (aScore == 0 && bScore == 0) return false;
+  set_result(st, aScore == bScore ? 2 : (aScore > bScore ? 0 : 1));
   st.effectStack.pop_back();
   st.pending = PendingDecision();
   st.checkupNext = -1;
@@ -12245,7 +12392,6 @@ static void post_attack(GameState& st, int attacker) {
       return;
     }
     bool delayedEndTurnKo = delayed_end_turn_would_ko(st, attacker);
-    clear_attack_damage_markers(st);
     end_turn(st);
     if (st.has_pending() && st.pending.context == 7 && !delayedEndTurnKo)
       clear_attack_end_turn_flags(st);
@@ -13168,31 +13314,6 @@ static void resolve_program(GameState& st, const std::vector<int>& sel,
     } else {
       st.lastEffectCount = draw_n(st, st.players[fr.a], 4);
     }
-  } else if (cur.kind == OP_REDEEMABLE_TICKET) {
-    Player& me = st.players[fr.a];
-    std::vector<int> picked;
-    for (int s : sel) {
-      if (s < 0 || s >= static_cast<int>(st.pending.options.size())) continue;
-      int idx = static_cast<int>(st.pending.options[s][2].i);
-      if (idx >= 0 && idx < static_cast<int>(fr.savedScratch.size()))
-        picked.push_back(fr.savedScratch[idx]);
-    }
-    if (picked.empty() && !fr.savedScratch.empty())
-      picked = fr.savedScratch;
-    me.prizes.clear();
-    me.prizeFaceUp.clear();
-    me.prizesKnownMask.clear();
-    me.prizesKnownCards.clear();
-    for (int cardId : picked) {
-      me.prizes.push_back(cardId);
-      me.prizeFaceUp.push_back(false);
-      me.prizesKnownMask.push_back(true);
-    }
-    me.prizeCount = static_cast<int>(me.prizes.size());
-    me.prizesKnown = true;
-    me.prizesKnown = static_cast<int>(picked.size()) == me.prizeCount;
-    fr.savedScratch.clear();
-    st.lastEffectCount = me.prizeCount;
   } else if (cur.kind == OP_ATTACH_BASIC_ENERGY_EACH_TARGET &&
              ((cur.p0 == AZ_DECK && cur.p3 == AET_OWN_BENCH) ||
               (cur.p0 == AZ_DISCARD && cur.p3 == AET_OWN_INPLAY))) {
@@ -13489,9 +13610,11 @@ void resolve(GameState& st, const std::vector<int>& selection,
 // --- free-running setup ---------------------------------------------------
 
 static void setup_player(GameState& st, int p) {
+  constexpr int kMaxSetupAttempts = 1024;
   Player& pl = st.players[p];
   // Mulligan: draw 7 until a Basic Pokemon is present.
-  while (true) {
+  bool found_basic = false;
+  for (int attempt = 0; attempt < kMaxSetupAttempts; ++attempt) {
     pl.hand.clear();
     for (int i = 0; i < 7 && !pl.deck.empty(); ++i) {
       pl.hand.push_back(pl.deck.back());
@@ -13505,10 +13628,17 @@ static void setup_player(GameState& st, int p) {
         break;
       }
     }
-    if (basic) break;
+    if (basic) {
+      found_basic = true;
+      break;
+    }
     for (int id : pl.hand) pl.deck.push_back(id);
     pl.hand.clear();
     shuffle_deck_known(pl, st.rng);
+  }
+  if (!found_basic) {
+    throw std::runtime_error(
+        "setup failed to draw a Basic Pokemon within 1024 attempts");
   }
   // Place the first Basic as Active; the rest of the Basics on the Bench.
   for (size_t i = 0; i < pl.hand.size(); ++i) {

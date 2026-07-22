@@ -150,8 +150,8 @@ static py::dict rl_state_observation_py(const GameState& st) {
               st.stadiumOwner == me ? 0 : (st.stadiumOwner == 1 - me ? 1 : -1),
               AREA_STADIUM, 0, !st.stadium.empty());
 
-  auto append_card_list = [&](const SmallVec<int, 64>& cards, int owner_pov,
-                              int slot_area, int count) {
+  auto append_card_list = [&](const auto& cards, int owner_pov, int slot_area,
+                              int count) {
     for (int i = 0; i < count; ++i) {
       const bool ok = i < static_cast<int>(cards.size());
       append_slot(ok ? cards[i] : 0, owner_pov, slot_area, i, ok);
@@ -1605,6 +1605,29 @@ static py::dict action_ids_dict(py::array_t<int32_t> meta,
   out["options"] = options;
   out["deck"] = deck;
   out["mask"] = mask;
+  out["attack_definition_column"] = ACTION_ATTACK_DEFINITION_COLUMN;
+  return out;
+}
+
+static void require_array_size(const py::array& array, py::ssize_t expected,
+                               const char* name) {
+  if (array.size() != expected)
+    throw std::runtime_error(std::string("bad ") + name + " buffer size");
+}
+
+static py::dict action_ids16_dict(py::array_t<int16_t> meta,
+                                  py::array_t<int16_t> options,
+                                  py::array_t<int16_t> deck,
+                                  py::array_t<uint8_t> mask) {
+  py::dict out;
+  out["meta"] = meta;
+  out["options"] = options;
+  out["deck"] = deck;
+  out["mask"] = mask;
+  out["attack_definition_column"] = ACTION_ATTACK_DEFINITION_COLUMN;
+  out["raw_ref_low_column"] = ACTION_RAW_REF_LOW_COLUMN;
+  out["raw_ref_high_column"] = ACTION_RAW_REF_HIGH_COLUMN;
+  out["raw_ref_shift"] = ACTION_RAW_REF_SHIFT;
   return out;
 }
 
@@ -1665,6 +1688,32 @@ static py::dict batched_state_ids_dict(py::array_t<int32_t> in_play,
   out["zone_deck"] = 1;
   out["zone_discard"] = 2;
   out["zone_prizes"] = 3;
+  return out;
+}
+
+static py::dict batched_state_ids16_dict(
+    py::array_t<int16_t> in_play, py::array_t<int16_t> zones,
+    py::array_t<int16_t> counts, py::array_t<int16_t> status,
+    py::array_t<int16_t> global, py::array_t<int16_t> select_meta,
+    py::array_t<int16_t> select_options, py::array_t<int16_t> select_deck) {
+  py::dict out;
+  out["in_play"] = in_play;
+  out["zones"] = zones;
+  out["player_counts"] = counts;
+  out["player_status"] = status;
+  out["global"] = global;
+  out["select_meta"] = select_meta;
+  out["select_options"] = select_options;
+  out["select_deck"] = select_deck;
+  out["empty_card_id"] = 0;
+  out["unknown_card_id"] = -1;
+  out["zone_hand"] = 0;
+  out["zone_deck"] = 1;
+  out["zone_discard"] = 2;
+  out["zone_prizes"] = 3;
+  out["raw_ref_low_column"] = ACTION_RAW_REF_LOW_COLUMN;
+  out["raw_ref_high_column"] = ACTION_RAW_REF_HIGH_COLUMN;
+  out["raw_ref_shift"] = ACTION_RAW_REF_SHIFT;
   return out;
 }
 
@@ -1729,6 +1778,78 @@ static py::tuple vector_step_ids_py(
       batched_state_ids_dict(in_play, zones, counts, status, global, meta,
                              options, deck),
       reward, done, action_ids_dict(meta, options, deck, mask), player, result);
+}
+
+static py::tuple vector_observe_ids16_py(VectorEnv& e) {
+  using Shape = std::vector<py::ssize_t>;
+  int n = e.size();
+  py::array_t<int16_t> in_play(
+      Shape{n, 2, STATE_INPLAY_SLOTS, STATE_INPLAY_WIDTH});
+  py::array_t<int16_t> zones(
+      Shape{n, 2, STATE_ZONE_COUNT, STATE_ZONE_SLOTS});
+  py::array_t<int16_t> counts(Shape{n, 2, 5}), status(Shape{n, 2, 5});
+  py::array_t<int16_t> global(Shape{n, STATE_GLOBAL_WIDTH});
+  py::array_t<int16_t> meta(Shape{n, ACTION_META_WIDTH});
+  py::array_t<int16_t> options(
+      Shape{n, RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
+  py::array_t<int16_t> deck(Shape{n, STATE_ZONE_SLOTS});
+  py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+  py::array_t<int32_t> player(Shape{n}), result(Shape{n});
+  bool ok;
+  {
+    py::gil_scoped_release rel;
+    ok = e.observe_ids16(
+        in_play.mutable_data(), zones.mutable_data(), counts.mutable_data(),
+        status.mutable_data(), global.mutable_data(), meta.mutable_data(),
+        options.mutable_data(), deck.mutable_data(), mask.mutable_data(),
+        player.mutable_data(), result.mutable_data());
+  }
+  if (!ok)
+    throw std::overflow_error(
+        "VectorEnv.observe_ids16(): an encoded value exceeds int16");
+  return py::make_tuple(
+      batched_state_ids16_dict(in_play, zones, counts, status, global, meta,
+                               options, deck),
+      action_ids16_dict(meta, options, deck, mask), player, result);
+}
+
+static py::tuple vector_step_ids16_py(
+    VectorEnv& e,
+    py::array_t<int, py::array::c_style | py::array::forcecast> actions) {
+  using Shape = std::vector<py::ssize_t>;
+  int n = e.size();
+  py::array_t<float> reward(Shape{n});
+  py::array_t<uint8_t> done(Shape{n});
+  py::array_t<int16_t> in_play(
+      Shape{n, 2, STATE_INPLAY_SLOTS, STATE_INPLAY_WIDTH});
+  py::array_t<int16_t> zones(
+      Shape{n, 2, STATE_ZONE_COUNT, STATE_ZONE_SLOTS});
+  py::array_t<int16_t> counts(Shape{n, 2, 5}), status(Shape{n, 2, 5});
+  py::array_t<int16_t> global(Shape{n, STATE_GLOBAL_WIDTH});
+  py::array_t<int16_t> meta(Shape{n, ACTION_META_WIDTH});
+  py::array_t<int16_t> options(
+      Shape{n, RL_MAX_ACTIONS, ACTION_OPTION_WIDTH});
+  py::array_t<int16_t> deck(Shape{n, STATE_ZONE_SLOTS});
+  py::array_t<uint8_t> mask(Shape{n, RL_MAX_ACTIONS});
+  py::array_t<int32_t> player(Shape{n}), result(Shape{n});
+  bool ok;
+  {
+    py::gil_scoped_release rel;
+    ok = e.step_ids16(
+        actions.data(), reward.mutable_data(), done.mutable_data(),
+        in_play.mutable_data(), zones.mutable_data(), counts.mutable_data(),
+        status.mutable_data(), global.mutable_data(), meta.mutable_data(),
+        options.mutable_data(), deck.mutable_data(), mask.mutable_data(),
+        player.mutable_data(), result.mutable_data());
+  }
+  if (!ok)
+    throw std::overflow_error(
+        "VectorEnv.step16(): an encoded value exceeds int16");
+  return py::make_tuple(
+      batched_state_ids16_dict(in_play, zones, counts, status, global, meta,
+                               options, deck),
+      reward, done, action_ids16_dict(meta, options, deck, mask), player,
+      result);
 }
 
 static py::tuple ppo_observe_ids_py(PpoBatchEnv& e) {
@@ -5486,6 +5607,8 @@ PYBIND11_MODULE(ptcg_engine, m) {
   m.attr("STATE_SELECT_OPTION_WIDTH") = STATE_SELECT_OPTION_WIDTH;
   m.attr("ACTION_META_WIDTH") = ACTION_META_WIDTH;
   m.attr("ACTION_OPTION_WIDTH") = ACTION_OPTION_WIDTH;
+  m.attr("ACTION_ATTACK_DEFINITION_COLUMN") =
+      ACTION_ATTACK_DEFINITION_COLUMN;
   m.attr("PPO_ACTION_FEAT_DIM") = PPO_ACTION_FEAT_DIM;
   m.attr("PPO_CARD_SLOTS") = PPO_CARD_SLOTS;
   m.attr("PPO_CARD_FEAT_DIM") = PPO_CARD_FEAT_DIM;
@@ -5903,6 +6026,9 @@ PYBIND11_MODULE(ptcg_engine, m) {
       .def("observe_ids", &vector_observe_ids_py,
            "Return (state_ids, action_ids, player, result) without generating "
            "engine float features.")
+      .def("observe_ids16", &vector_observe_ids16_py,
+           "Return compact signed-int16 state/action IDs. Composite raw action "
+           "references are split across option columns 18 and 19.")
       .def("state_ids",
            [](VectorEnv& e) {
              int n = e.size();
@@ -5971,26 +6097,22 @@ PYBIND11_MODULE(ptcg_engine, m) {
              I32Array select_meta = out["select_meta"].cast<I32Array>();
              I32Array select_options = out["select_options"].cast<I32Array>();
              I32Array select_deck = out["select_deck"].cast<I32Array>();
-             auto require_size = [](const py::array& a, py::ssize_t expected,
-                                    const char* name) {
-               if (a.size() != expected) {
-                 throw std::runtime_error(std::string("bad ") + name +
-                                          " buffer size");
-               }
-             };
-             require_size(in_play, n * 2 * STATE_INPLAY_SLOTS *
-                                       STATE_INPLAY_WIDTH, "in_play");
-             require_size(zones, n * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
-                          "zones");
-             require_size(counts, n * 2 * 5, "player_counts");
-             require_size(status, n * 2 * 5, "player_status");
-             require_size(global, n * STATE_GLOBAL_WIDTH, "global");
-             require_size(select_meta, n * STATE_SELECT_META_WIDTH,
-                          "select_meta");
-             require_size(select_options,
-                          n * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
-                          "select_options");
-             require_size(select_deck, n * STATE_ZONE_SLOTS, "select_deck");
+             require_array_size(in_play, n * 2 * STATE_INPLAY_SLOTS *
+                                             STATE_INPLAY_WIDTH, "in_play");
+             require_array_size(zones,
+                                n * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+                                "zones");
+             require_array_size(counts, n * 2 * 5, "player_counts");
+             require_array_size(status, n * 2 * 5, "player_status");
+             require_array_size(global, n * STATE_GLOBAL_WIDTH, "global");
+             require_array_size(select_meta, n * STATE_SELECT_META_WIDTH,
+                                "select_meta");
+             require_array_size(
+                 select_options,
+                 n * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
+                 "select_options");
+             require_array_size(select_deck, n * STATE_ZONE_SLOTS,
+                                "select_deck");
 
              py::gil_scoped_release rel;
              for (int i = 0; i < n; ++i) {
@@ -6047,18 +6169,11 @@ PYBIND11_MODULE(ptcg_engine, m) {
              I32Array options = out["options"].cast<I32Array>();
              I32Array deck = out["deck"].cast<I32Array>();
              U8Array mask = out["mask"].cast<U8Array>();
-             auto require_size = [](const py::array& a, py::ssize_t expected,
-                                    const char* name) {
-               if (a.size() != expected) {
-                 throw std::runtime_error(std::string("bad ") + name +
-                                          " buffer size");
-               }
-             };
-             require_size(meta, n * ACTION_META_WIDTH, "meta");
-             require_size(options, n * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
-                          "options");
-             require_size(deck, n * STATE_ZONE_SLOTS, "deck");
-             require_size(mask, n * RL_MAX_ACTIONS, "mask");
+             require_array_size(meta, n * ACTION_META_WIDTH, "meta");
+             require_array_size(
+                 options, n * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH, "options");
+             require_array_size(deck, n * STATE_ZONE_SLOTS, "deck");
+             require_array_size(mask, n * RL_MAX_ACTIONS, "mask");
 
              py::gil_scoped_release rel;
              for (int i = 0; i < n; ++i) {
@@ -6094,33 +6209,29 @@ PYBIND11_MODULE(ptcg_engine, m) {
              I32Array options = action_out["options"].cast<I32Array>();
              I32Array deck = action_out["deck"].cast<I32Array>();
              U8Array mask = action_out["mask"].cast<U8Array>();
-             auto require_size = [](const py::array& a, py::ssize_t expected,
-                                    const char* name) {
-               if (a.size() != expected) {
-                 throw std::runtime_error(std::string("bad ") + name +
-                                          " buffer size");
-               }
-             };
-             require_size(in_play, n * 2 * STATE_INPLAY_SLOTS *
-                                       STATE_INPLAY_WIDTH, "in_play");
-             require_size(zones, n * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
-                          "zones");
-             require_size(counts, n * 2 * 5, "player_counts");
-             require_size(status, n * 2 * 5, "player_status");
-             require_size(global, n * STATE_GLOBAL_WIDTH, "global");
-             require_size(select_meta, n * STATE_SELECT_META_WIDTH,
-                          "select_meta");
-             require_size(select_options,
-                          n * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
-                          "select_options");
-             require_size(select_deck, n * STATE_ZONE_SLOTS, "select_deck");
-             require_size(meta, n * ACTION_META_WIDTH, "meta");
-             require_size(options, n * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH,
-                          "options");
-             require_size(deck, n * STATE_ZONE_SLOTS, "deck");
-             require_size(mask, n * RL_MAX_ACTIONS, "mask");
-             require_size(player, n, "player");
-             require_size(result, n, "result");
+             require_array_size(in_play, n * 2 * STATE_INPLAY_SLOTS *
+                                             STATE_INPLAY_WIDTH, "in_play");
+             require_array_size(zones,
+                                n * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS,
+                                "zones");
+             require_array_size(counts, n * 2 * 5, "player_counts");
+             require_array_size(status, n * 2 * 5, "player_status");
+             require_array_size(global, n * STATE_GLOBAL_WIDTH, "global");
+             require_array_size(select_meta, n * STATE_SELECT_META_WIDTH,
+                                "select_meta");
+             require_array_size(
+                 select_options,
+                 n * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
+                 "select_options");
+             require_array_size(select_deck, n * STATE_ZONE_SLOTS,
+                                "select_deck");
+             require_array_size(meta, n * ACTION_META_WIDTH, "meta");
+             require_array_size(
+                 options, n * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH, "options");
+             require_array_size(deck, n * STATE_ZONE_SLOTS, "deck");
+             require_array_size(mask, n * RL_MAX_ACTIONS, "mask");
+             require_array_size(player, n, "player");
+             require_array_size(result, n, "result");
 
              py::gil_scoped_release rel;
              e.observe_ids(in_play.mutable_data(), zones.mutable_data(),
@@ -6146,6 +6257,95 @@ PYBIND11_MODULE(ptcg_engine, m) {
            "Step all games and return "
            "(state_ids, reward, done, action_ids, player, result) without "
            "generating engine float features.")
+      .def("step16", &vector_step_ids16_py, py::arg("actions"),
+           "Step all games and return compact signed-int16 state/action IDs. "
+           "Raises OverflowError rather than truncating an out-of-range field.")
+      .def(
+          "step16_into",
+          [](VectorEnv& e,
+             py::array_t<int, py::array::c_style | py::array::forcecast>
+                 actions,
+             py::dict state_out, py::dict action_out,
+             py::array_t<float, py::array::c_style> reward,
+             py::array_t<uint8_t, py::array::c_style> done,
+             py::array_t<int32_t, py::array::c_style> player,
+             py::array_t<int32_t, py::array::c_style> result) {
+            using I16Array = py::array_t<int16_t, py::array::c_style>;
+            using U8Array = py::array_t<uint8_t, py::array::c_style>;
+            int n = e.size();
+            I16Array in_play = state_out["in_play"].cast<I16Array>();
+            I16Array zones = state_out["zones"].cast<I16Array>();
+            I16Array counts = state_out["player_counts"].cast<I16Array>();
+            I16Array status = state_out["player_status"].cast<I16Array>();
+            I16Array global = state_out["global"].cast<I16Array>();
+            I16Array select_meta = state_out["select_meta"].cast<I16Array>();
+            I16Array select_options =
+                state_out["select_options"].cast<I16Array>();
+            I16Array select_deck = state_out["select_deck"].cast<I16Array>();
+            I16Array meta = action_out["meta"].cast<I16Array>();
+            I16Array options = action_out["options"].cast<I16Array>();
+            I16Array deck = action_out["deck"].cast<I16Array>();
+            U8Array mask = action_out["mask"].cast<U8Array>();
+            require_array_size(actions, n, "actions");
+            require_array_size(in_play, n * 2 * STATE_INPLAY_SLOTS *
+                                            STATE_INPLAY_WIDTH, "in_play");
+            require_array_size(
+                zones, n * 2 * STATE_ZONE_COUNT * STATE_ZONE_SLOTS, "zones");
+            require_array_size(counts, n * 2 * 5, "player_counts");
+            require_array_size(status, n * 2 * 5, "player_status");
+            require_array_size(global, n * STATE_GLOBAL_WIDTH, "global");
+            require_array_size(select_meta, n * STATE_SELECT_META_WIDTH,
+                               "select_meta");
+            require_array_size(
+                select_options,
+                n * RL_MAX_ACTIONS * STATE_SELECT_OPTION_WIDTH,
+                "select_options");
+            require_array_size(select_deck, n * STATE_ZONE_SLOTS,
+                               "select_deck");
+            require_array_size(meta, n * ACTION_META_WIDTH, "meta");
+            require_array_size(
+                options, n * RL_MAX_ACTIONS * ACTION_OPTION_WIDTH, "options");
+            require_array_size(deck, n * STATE_ZONE_SLOTS, "deck");
+            require_array_size(mask, n * RL_MAX_ACTIONS, "mask");
+            require_array_size(reward, n, "reward");
+            require_array_size(done, n, "done");
+            require_array_size(player, n, "player");
+            require_array_size(result, n, "result");
+
+            bool ok;
+            {
+              py::gil_scoped_release rel;
+              ok = e.step_ids16(
+                  actions.data(), reward.mutable_data(), done.mutable_data(),
+                  in_play.mutable_data(), zones.mutable_data(),
+                  counts.mutable_data(), status.mutable_data(),
+                  global.mutable_data(), meta.mutable_data(),
+                  options.mutable_data(), deck.mutable_data(),
+                  mask.mutable_data(), player.mutable_data(),
+                  result.mutable_data());
+              if (select_meta.data() != meta.data())
+                std::memcpy(select_meta.mutable_data(), meta.data(),
+                            static_cast<size_t>(n) * STATE_SELECT_META_WIDTH *
+                                sizeof(int16_t));
+              if (select_options.data() != options.data())
+                std::memcpy(
+                    select_options.mutable_data(), options.data(),
+                    static_cast<size_t>(n) * RL_MAX_ACTIONS *
+                        STATE_SELECT_OPTION_WIDTH * sizeof(int16_t));
+              if (select_deck.data() != deck.data())
+                std::memcpy(select_deck.mutable_data(), deck.data(),
+                            static_cast<size_t>(n) * STATE_ZONE_SLOTS *
+                                sizeof(int16_t));
+            }
+            if (!ok)
+              throw std::overflow_error(
+                  "VectorEnv.step16_into(): an encoded value exceeds int16");
+          },
+          py::arg("actions"), py::arg("state_out"), py::arg("action_out"),
+          py::arg("reward"), py::arg("done"), py::arg("player"),
+          py::arg("result"),
+          "Step into caller-owned compact buffers without allocating outputs. "
+          "Buffers returned by observe_ids16() can be reused directly.")
       .def("step_features",
            [](VectorEnv& e,
               py::array_t<int, py::array::c_style | py::array::forcecast> actions) {

@@ -16,10 +16,23 @@ class SerialData(ctypes.Structure):
         ("selectPlayer", ctypes.c_int)
     ]
 
-if os.name == 'nt':
-    lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cg.dll")
-else:
-    lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libcg.so")
+lib_name = "cg.dll" if os.name == "nt" else "libcg.so"
+here = os.path.dirname(os.path.abspath(__file__))
+root = os.path.dirname(os.path.dirname(here))
+workspace = os.path.dirname(root)
+candidates = [
+    os.environ.get("PTCG_REFERENCE_LIB", ""),
+    os.path.join(here, lib_name),
+    os.path.join(root, "cg", lib_name),
+    os.path.join(workspace, "cg", lib_name),
+    os.path.join(workspace, "data", "sample_submission", "cg", lib_name),
+]
+lib_path = next((path for path in candidates if path and os.path.isfile(path)), "")
+if not lib_path:
+    raise FileNotFoundError(
+        f"reference {lib_name} not found; set PTCG_REFERENCE_LIB or provide "
+        "cg/ or data/sample_submission/cg/ beside the repository"
+    )
 lib = ctypes.cdll.LoadLibrary(lib_path)
 
 lib.GameInitialize()

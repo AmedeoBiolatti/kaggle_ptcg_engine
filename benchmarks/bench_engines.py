@@ -356,6 +356,55 @@ def bench_native_vectorized_action_ids(
     return done_steps, batch_size
 
 
+def bench_native_vectorized_ids16(
+    deck0: list[int], deck1: list[int], *, steps: int, seed: int,
+    batch_size: int, selector: str, reuse: bool,
+) -> tuple[int, int]:
+    _clear_native_modules()
+    _prefer_native_paths()
+    import ptcg_engine as E
+
+    rng = np.random.default_rng(seed)
+    env = E.VectorEnv(deck0, deck1, batch_size, seed)
+    state, action, player, result = env.observe_ids16()
+    actions = np.zeros(batch_size, dtype=np.int32)
+    reward = np.empty(batch_size, dtype=np.float32)
+    done = np.empty(batch_size, dtype=np.uint8)
+    done_steps = 0
+    while done_steps < steps:
+        if selector != "first":
+            actions = _random_actions_from_mask(action["mask"], rng)
+        if reuse:
+            env.step16_into(
+                actions, state, action, reward, done, player, result
+            )
+        else:
+            state, reward, done, action, player, result = env.step16(actions)
+        done_steps += batch_size
+    return done_steps, batch_size
+
+
+def bench_native_vectorized_ids32(
+    deck0: list[int], deck1: list[int], *, steps: int, seed: int,
+    batch_size: int, selector: str,
+) -> tuple[int, int]:
+    _clear_native_modules()
+    _prefer_native_paths()
+    import ptcg_engine as E
+
+    rng = np.random.default_rng(seed)
+    env = E.VectorEnv(deck0, deck1, batch_size, seed)
+    _state, action, _player, _result = env.observe_ids()
+    actions = np.zeros(batch_size, dtype=np.int32)
+    done_steps = 0
+    while done_steps < steps:
+        if selector != "first":
+            actions = _random_actions_from_mask(action["mask"], rng)
+        _state, _reward, _done, action, _player, _result = env.step(actions)
+        done_steps += batch_size
+    return done_steps, batch_size
+
+
 def bench_native_nn_adapter(
     deck0: list[int],
     deck1: list[int],
@@ -1861,6 +1910,41 @@ def run(args: argparse.Namespace) -> list[BenchResult]:
                 seed=args.seed,
                 batch_size=args.batch_size,
                 selector=args.selector,
+            ),
+        ),
+        (
+            "native_vectorized_ids32",
+            lambda: bench_native_vectorized_ids32(
+                deck0,
+                deck1,
+                steps=args.steps,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                selector=args.selector,
+            ),
+        ),
+        (
+            "native_vectorized_ids16",
+            lambda: bench_native_vectorized_ids16(
+                deck0,
+                deck1,
+                steps=args.steps,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                selector=args.selector,
+                reuse=False,
+            ),
+        ),
+        (
+            "native_vectorized_ids16_into",
+            lambda: bench_native_vectorized_ids16(
+                deck0,
+                deck1,
+                steps=args.steps,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                selector=args.selector,
+                reuse=True,
             ),
         ),
         (

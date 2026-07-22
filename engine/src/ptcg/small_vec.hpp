@@ -32,7 +32,10 @@ class SmallVec {
   SmallVec(SmallVec&& o) noexcept { steal_or_move(std::move(o)); }
   // std::vector interop for boundary code (copies; hot paths should take the
   // SmallVec directly or a template parameter instead).
-  SmallVec(const std::vector<T>& v) { assign(v.begin(), v.end()); }
+  SmallVec(const std::vector<T>& v) {
+    reserve(v.size());
+    assign(v.begin(), v.end());
+  }
   // cross-capacity copies (same element type, different inline N)
   template <size_t M>
   SmallVec(const SmallVec<T, M>& o) { assign(o.begin(), o.end()); }
@@ -54,6 +57,7 @@ class SmallVec {
     return *this;
   }
   SmallVec& operator=(const std::vector<T>& v) {
+    reserve(v.size());
     assign(v.begin(), v.end());
     return *this;
   }
